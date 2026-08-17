@@ -145,7 +145,12 @@ function registerBody(overrides: Record<string, unknown> = {}): string {
 	});
 }
 
-async function post(body: string, headers: Record<string, string> = {}, path = '/ticket'): Promise<Response> {
+async function post(
+	body: string,
+	headers: Record<string, string> = {},
+	path = '/ticket',
+	env: typeof testEnv = testEnv,
+): Promise<Response> {
 	const ctx = createExecutionContext();
 	const response = await worker.fetch(
 		new Request('https://worker' + path, {
@@ -153,11 +158,24 @@ async function post(body: string, headers: Record<string, string> = {}, path = '
 			headers: { 'Content-Type': 'application/json', Origin: 'https://staging.autism-allyship.pages.dev', ...headers },
 			body,
 		}),
-		testEnv,
+		env,
 		ctx,
 	);
 	await waitOnExecutionContext(ctx);
 	return response;
+}
+
+const BREVO_ORIGIN = 'https://api.brevo.com';
+const envWithBrevo = { ...testEnv, BREVO_API_KEY: 'test-brevo-key' };
+
+// Registered after mockAttempt() for the same test, since the code only
+// reaches the Brevo call once the Firestore transaction has already
+// committed and returned a token.
+function mockBrevo(status: 200 | 401): void {
+	fetchMock
+		.get(BREVO_ORIGIN)
+		.intercept({ path: '/v3/smtp/email', method: 'POST' })
+		.reply(status, status === 200 ? { messageId: 'test-message-id' } : { message: 'Key not found' });
 }
 
 describe('the ticket registration endpoint', () => {
@@ -272,6 +290,42 @@ describe('the ticket registration endpoint', () => {
 		// 20 random bytes, base64url, no padding: 27 characters, inside the
 		// 20-30 range RULES-WEBSITE.md calls for.
 		expect(result.token).toMatch(/^[A-Za-z0-9_-]{26,28}$/);
+	});
+
+	it('sends a confirmation email and reports emailSent true when Brevo accepts it', async () => {
+		mockAttempt({ event: eventFields({ capacity: 10, ticketsSold: 3 }), result: 'committed' });
+		mockBrevo(200);
+		const response = await post(registerBody({ quantity: 2 }), {}, '/ticket', envWithBrevo);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; token: string; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.token).toBeTruthy();
+		expect(result.emailSent).toBe(true);
+	});
+
+	it('still returns a valid ticket, with emailSent false, when Brevo rejects the request', async () => {
+		mockAttempt({ event: eventFields({ capacity: 10, ticketsSold: 3 }), result: 'committed' });
+		mockBrevo(401);
+		const response = await post(registerBody({ quantity: 2 }), {}, '/ticket', envWithBrevo);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; token: string; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.token).toBeTruthy();
+		expect(result.emailSent).toBe(false);
+	});
+
+	it('still returns a valid ticket, with emailSent false, when no Brevo key is configured', async () => {
+		// No mockBrevo() call: BREVO_API_KEY is absent from plain testEnv, so
+		// the code must never attempt the call at all. If it did, fetchMock's
+		// disableNetConnect() from beforeEach would fail this test with an
+		// unmocked-request error rather than a clean false.
+		mockAttempt({ event: eventFields({ capacity: 10, ticketsSold: 3 }), result: 'committed' });
+		const response = await post(registerBody({ quantity: 2 }));
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; token: string; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.token).toBeTruthy();
+		expect(result.emailSent).toBe(false);
 	});
 
 	it('gives two registrations different tokens', async () => {

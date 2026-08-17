@@ -8,6 +8,7 @@
 interface Env {
 	FIREBASE_PROJECT_ID: string;
 	FIREBASE_SERVICE_ACCOUNT: string; // secret: the whole downloaded service account JSON key file, as text
+	BREVO_API_KEY?: string; // secret: absent until Section 6's Brevo setup is done, and the confirmation email is skipped rather than failing the registration until then
 }
 
 const TICKET_PATH = '/ticket';
@@ -114,7 +115,22 @@ export default {
 			if ('error' in result) {
 				return json({ error: result.error }, result.status, origin);
 			}
-			return json({ ok: true, token: result.token }, 200, origin);
+
+			// Sending is never allowed to fail the registration: the ticket
+			// already exists by the time this runs, and the visitor already has
+			// the link on screen. The page is told honestly whether it went out,
+			// rather than the response claiming success unconditionally.
+			const ticketUrl = origin + '/ticket.html?token=' + encodeURIComponent(result.token);
+			const emailSent = await sendConfirmationEmail(env, {
+				ticketUrl,
+				eventTitle: result.eventTitle,
+				eventStartsAt: result.eventStartsAt,
+				attendeeName: body.attendeeName.trim(),
+				attendeeEmail: body.attendeeEmail.trim(),
+				quantity: body.quantity,
+			});
+
+			return json({ ok: true, token: result.token, emailSent }, 200, origin);
 		} catch (error) {
 			console.error('Ticket registration failed:', error);
 			return json({ error: 'Registration failed. Try again.' }, 500, origin);
@@ -147,7 +163,9 @@ function validateRequest(body: RegisterRequest): string | null {
 	return null;
 }
 
-type RegisterResult = { token: string } | { error: string; status: number };
+type RegisterResult =
+	| { token: string; eventTitle: string; eventStartsAt: string | null }
+	| { error: string; status: number };
 
 // Reads the event, checks it is bookable, checks capacity and creates the
 // ticket, all inside one Firestore transaction. The read of the event
@@ -237,13 +255,117 @@ async function registerTicket(env: Env, body: RegisterRequest): Promise<Register
 
 		const committed = await commit(env, accessToken, transactionId, writes);
 		if (committed) {
-			return { token };
+			return { token, eventTitle, eventStartsAt };
 		}
 		// Aborted: someone else wrote to the event between our read and our
 		// commit. Loop and try again against the fresh state.
 	}
 
 	return { error: 'Could not complete the booking, please try again.', status: 409 };
+}
+
+// --- Confirmation email ---
+//
+// Sent through Brevo's transactional email API. The sender address is a
+// personal Gmail rather than the foundation's own domain: a single verified
+// sender works immediately with no DNS access, whereas sending as
+// info@autismallyship.org needs SPF and DKIM records added to their DNS,
+// which is the "verify the sending domain" line in CONSOLE-STEPS.md's
+// Still to come. Mail may land in spam until that is done. Fine for testing,
+// must be fixed before launch.
+const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
+const SENDER_EMAIL = 'durellvicjardim@gmail.com';
+const SENDER_NAME = 'Autism Allyship Foundation';
+
+interface ConfirmationEmailInput {
+	ticketUrl: string;
+	eventTitle: string;
+	eventStartsAt: string | null;
+	attendeeName: string;
+	attendeeEmail: string;
+	quantity: number;
+}
+
+// Never allowed to fail the registration: the ticket already exists in
+// Firestore by the time this runs, and the visitor already has the link on
+// screen either way. A missing key, a Brevo outage, or a rejected request is
+// logged and swallowed, and the caller is told honestly whether it went out
+// so the confirmation page never claims an email that was not actually sent.
+async function sendConfirmationEmail(env: Env, input: ConfirmationEmailInput): Promise<boolean> {
+	if (!env.BREVO_API_KEY) {
+		return false;
+	}
+
+	// Per SCHEMA.md: never "this ticket belongs to", since a booking is
+	// transferable at no cost and forwarding the link is expected use.
+	const bookedBy =
+		input.quantity === 1 ? `Booked by ${input.attendeeName}, 1 person` : `Booked by ${input.attendeeName}, ${input.quantity} people`;
+	const when = input.eventStartsAt ? formatEventTime(input.eventStartsAt) : '';
+
+	try {
+		const response = await fetch(BREVO_API_URL, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				Accept: 'application/json',
+				'api-key': env.BREVO_API_KEY,
+			},
+			body: JSON.stringify({
+				sender: { name: SENDER_NAME, email: SENDER_EMAIL },
+				to: [{ email: input.attendeeEmail, name: input.attendeeName }],
+				subject: `Your ticket for ${input.eventTitle}`,
+				htmlContent: buildEmailHtml(input, bookedBy, when),
+				textContent: buildEmailText(input, bookedBy, when),
+			}),
+		});
+		if (!response.ok) {
+			console.error('Brevo send failed:', response.status, await response.text());
+			return false;
+		}
+		return true;
+	} catch (error) {
+		console.error('Brevo send threw:', error);
+		return false;
+	}
+}
+
+function formatEventTime(iso: string): string {
+	const date = new Date(iso);
+	if (Number.isNaN(date.getTime())) {
+		return '';
+	}
+	return date.toLocaleDateString('en-ZA') + ' ' + date.toLocaleTimeString('en-ZA', { hour: '2-digit', minute: '2-digit' });
+}
+
+// The ticket link goes in as a plain visible URL, not only inside a styled
+// button: a link someone can select and copy straight out of a mail client
+// is the fallback for when every other save action in the app has failed.
+function buildEmailText(input: ConfirmationEmailInput, bookedBy: string, when: string): string {
+	const lines = [
+		`Your ticket for ${input.eventTitle}`,
+		when ? `When: ${when}` : '',
+		bookedBy,
+		'',
+		'This link is your ticket. There is no account to recover it from, so save it somewhere safe:',
+		input.ticketUrl,
+	];
+	return lines.filter((line) => line !== '').join('\n');
+}
+
+function buildEmailHtml(input: ConfirmationEmailInput, bookedBy: string, when: string): string {
+	return [
+		`<p>Your ticket for <strong>${escapeHtml(input.eventTitle)}</strong></p>`,
+		when ? `<p>${escapeHtml(when)}</p>` : '',
+		`<p>${escapeHtml(bookedBy)}</p>`,
+		`<p>This link is your ticket. There is no account to recover it from, so save it somewhere safe:<br>`,
+		`<a href="${escapeHtml(input.ticketUrl)}">${escapeHtml(input.ticketUrl)}</a></p>`,
+	]
+		.filter((line) => line !== '')
+		.join('\n');
+}
+
+function escapeHtml(text: string): string {
+	return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // Twenty random bytes, base64url encoded, comes out to about 27 characters:
