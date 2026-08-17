@@ -266,15 +266,17 @@ async function registerTicket(env: Env, body: RegisterRequest): Promise<Register
 
 // --- Confirmation email ---
 //
-// Sent through Brevo's transactional email API. The sender address is a
-// personal Gmail rather than the foundation's own domain: a single verified
-// sender works immediately with no DNS access, whereas sending as
-// info@autismallyship.org needs SPF and DKIM records added to their DNS,
-// which is the "verify the sending domain" line in CONSOLE-STEPS.md's
-// Still to come. Mail may land in spam until that is done. Fine for testing,
-// must be fixed before launch.
+// Sent through Brevo's transactional email API. The sender address is the
+// shared project Gmail (CONSOLE-STEPS.md: "the shared project account, used
+// for Firebase and Cloudflare") rather than the foundation's own domain: a
+// single verified sender works immediately with no DNS access, whereas
+// sending as info@autismallyship.org needs SPF and DKIM records added to
+// their DNS, which is the "verify the sending domain" line in
+// CONSOLE-STEPS.md's Still to come. Mail may land in spam until that is
+// done. Fine for testing, must be fixed before launch. Must match a sender
+// verified in the Brevo account exactly, or Brevo rejects the send outright.
 const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
-const SENDER_EMAIL = 'durellvicjardim@gmail.com';
+const SENDER_EMAIL = 'kdmeco.dev@gmail.com';
 const SENDER_NAME = 'Autism Allyship Foundation';
 
 interface ConfirmationEmailInput {
