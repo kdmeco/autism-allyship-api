@@ -12,6 +12,10 @@ interface Env {
 }
 
 const TICKET_PATH = '/ticket';
+const RESEND_PATH = '/attendees/resend';
+const EDIT_EMAIL_PATH = '/attendees/edit-email';
+const MARK_USED_PATH = '/attendees/mark-used';
+const ADMIN_PATHS = [RESEND_PATH, EDIT_EMAIL_PATH, MARK_USED_PATH];
 
 // A family arrives together, per SCHEMA.md's reasoning for why one booking
 // covers a quantity rather than issuing one ticket per person. Past ten this
@@ -59,7 +63,7 @@ function corsHeaders(origin: string | null): Record<string, string> {
 	return {
 		'Access-Control-Allow-Origin': origin,
 		'Access-Control-Allow-Methods': 'POST, OPTIONS',
-		'Access-Control-Allow-Headers': 'Content-Type',
+		'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 		'Access-Control-Max-Age': '86400',
 	};
 }
@@ -86,9 +90,6 @@ export default {
 		}
 
 		const pathname = new URL(request.url).pathname;
-		if (pathname !== TICKET_PATH) {
-			return json({ error: 'Not found' }, 404, origin);
-		}
 
 		if (request.method !== 'POST') {
 			return json({ error: 'Method not allowed' }, 405, origin);
@@ -96,6 +97,14 @@ export default {
 
 		if (origin === '') {
 			return json({ error: 'Not allowed' }, 403, origin);
+		}
+
+		if (ADMIN_PATHS.includes(pathname)) {
+			return handleAdminRequest(request, env, origin, pathname);
+		}
+
+		if (pathname !== TICKET_PATH) {
+			return json({ error: 'Not found' }, 404, origin);
 		}
 
 		let body: RegisterRequest;
@@ -137,6 +146,225 @@ export default {
 		}
 	},
 };
+
+// --- Admin token verification ---
+//
+// Checks the Firebase ID token the same way the upload Worker does: RS256
+// signature against Google's public keys, then issuer, audience, expiry.
+// From there this Worker diverges: rather than a hardcoded ADMIN_UIDS
+// secret, it checks the admins/{uid} collection directly, the same source
+// of truth every Firestore security rule's isAdmin() already reads.
+// Revoking someone is deleting that document, same as everywhere else, no
+// second list to keep in sync.
+const JWKS_URL = 'https://www.googleapis.com/robot/v1/metadata/jwk/securetoken@system.gserviceaccount.com';
+const JWKS_CACHE_MS = 60 * 60 * 1000;
+type SigningKey = JsonWebKey & { kid?: string };
+let jwksCache: { keys: SigningKey[]; fetchedAt: number } | null = null;
+
+async function fetchJwks(): Promise<SigningKey[]> {
+	if (jwksCache && Date.now() - jwksCache.fetchedAt < JWKS_CACHE_MS) {
+		return jwksCache.keys;
+	}
+	const response = await fetch(JWKS_URL);
+	if (!response.ok) {
+		throw new Error('Could not load the token signing keys: ' + response.status);
+	}
+	const data = (await response.json()) as { keys: SigningKey[] };
+	jwksCache = { keys: data.keys, fetchedAt: Date.now() };
+	return data.keys;
+}
+
+function decodeBase64Url(part: string): ArrayBuffer {
+	const binary = atob(part.replace(/-/g, '+').replace(/_/g, '/'));
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) {
+		bytes[i] = binary.charCodeAt(i);
+	}
+	return bytes.buffer;
+}
+
+function decodeJson(part: string): any {
+	try {
+		return JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')));
+	} catch {
+		return null;
+	}
+}
+
+async function verifyAdmin(request: Request, env: Env): Promise<string | null> {
+	const authHeader = request.headers.get('Authorization');
+	if (!authHeader || !authHeader.startsWith('Bearer ')) {
+		return null;
+	}
+
+	const idToken = authHeader.slice('Bearer '.length);
+	const parts = idToken.split('.');
+	if (parts.length !== 3) {
+		return null;
+	}
+
+	const header = decodeJson(parts[0]);
+	const payload = decodeJson(parts[1]);
+	if (!header || !payload) {
+		return null;
+	}
+	if (header.alg !== 'RS256' || typeof header.kid !== 'string') {
+		return null;
+	}
+
+	try {
+		const keys = await fetchJwks();
+		const jwk = keys.find((key) => key.kid === header.kid);
+		if (!jwk) {
+			return null;
+		}
+
+		const key = await crypto.subtle.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+		const signatureOk = await crypto.subtle.verify(
+			'RSASSA-PKCS1-v1_5',
+			key,
+			decodeBase64Url(parts[2]),
+			new TextEncoder().encode(`${parts[0]}.${parts[1]}`),
+		);
+		if (!signatureOk) {
+			return null;
+		}
+
+		if (payload.iss !== `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`) {
+			return null;
+		}
+		if (payload.aud !== env.FIREBASE_PROJECT_ID) {
+			return null;
+		}
+		if (typeof payload.exp !== 'number' || payload.exp * 1000 < Date.now()) {
+			return null;
+		}
+		if (typeof payload.sub !== 'string' || payload.sub === '') {
+			return null;
+		}
+
+		const accessToken = await getAccessToken(env);
+		const adminDoc = await getDocument(env, accessToken, 'admins/' + payload.sub);
+		return adminDoc ? payload.sub : null;
+	} catch (error) {
+		console.error('Admin token check failed:', error);
+		return null;
+	}
+}
+
+// --- Admin attendee actions ---
+//
+// Resend, edit-email and mark-used all need a privileged Firestore write:
+// resend and edit-email touch a ticket outside the one transition the
+// security rules allow at all (staff redeeming their own scan), and
+// mark-used is exactly that transition but done from the admin desk rather
+// than the door scanner, so it deliberately does not require the caller to
+// also be in the staff collection. All three run with the same
+// service-account credential the registration endpoint already uses,
+// gated on a verified admin token instead of an open origin check.
+async function handleAdminRequest(request: Request, env: Env, origin: string | null, pathname: string): Promise<Response> {
+	const adminUid = await verifyAdmin(request, env);
+	if (!adminUid) {
+		return json({ error: 'Sign in as an admin.' }, 401, origin);
+	}
+
+	let body: Record<string, unknown>;
+	try {
+		body = (await request.json()) as Record<string, unknown>;
+	} catch {
+		return json({ error: 'Invalid JSON body' }, 400, origin);
+	}
+
+	const token = typeof body.token === 'string' ? body.token : '';
+	if (!token) {
+		return json({ error: 'A ticket token is required.' }, 400, origin);
+	}
+
+	try {
+		if (pathname === RESEND_PATH) {
+			return json(await resendTicketEmail(env, origin, token), 200, origin);
+		}
+		if (pathname === EDIT_EMAIL_PATH) {
+			const newEmail = typeof body.newEmail === 'string' ? body.newEmail.trim() : '';
+			if (!EMAIL_PATTERN.test(newEmail) || newEmail.length > MAX_EMAIL_LENGTH) {
+				return json({ error: 'Please enter a valid email address.' }, 400, origin);
+			}
+			return json(await editTicketEmail(env, origin, token, newEmail), 200, origin);
+		}
+		if (pathname === MARK_USED_PATH) {
+			return json(await markTicketUsed(env, token), 200, origin);
+		}
+	} catch (error) {
+		if (error instanceof AdminActionError) {
+			return json({ error: error.message }, error.status, origin);
+		}
+		console.error('Admin attendee action failed:', pathname, error);
+		return json({ error: 'That did not work. Try again.' }, 500, origin);
+	}
+
+	return json({ error: 'Not found' }, 404, origin);
+}
+
+class AdminActionError extends Error {
+	status: number;
+	constructor(message: string, status: number) {
+		super(message);
+		this.status = status;
+	}
+}
+
+async function getTicketOrThrow(env: Env, accessToken: string, token: string): Promise<Record<string, unknown>> {
+	const doc = await getDocument(env, accessToken, 'tickets/' + token);
+	if (!doc) {
+		throw new AdminActionError('That ticket could not be found.', 404);
+	}
+	return parseFields(doc.fields || {});
+}
+
+async function resendTicketEmail(env: Env, origin: string | null, token: string): Promise<{ ok: true; emailSent: boolean }> {
+	const accessToken = await getAccessToken(env);
+	const ticket = await getTicketOrThrow(env, accessToken, token);
+	const emailSent = await sendConfirmationEmail(env, {
+		ticketUrl: origin + '/ticket.html?token=' + encodeURIComponent(token),
+		eventTitle: typeof ticket.eventTitle === 'string' ? ticket.eventTitle : 'the event',
+		eventStartsAt: typeof ticket.eventStartsAt === 'string' ? ticket.eventStartsAt : null,
+		attendeeName: typeof ticket.attendeeName === 'string' ? ticket.attendeeName : '',
+		attendeeEmail: typeof ticket.attendeeEmail === 'string' ? ticket.attendeeEmail : '',
+		quantity: typeof ticket.quantity === 'number' ? ticket.quantity : 1,
+	});
+	return { ok: true, emailSent };
+}
+
+// The wrong-email case SCHEMA.md calls common: correct the address, then
+// resend to the corrected one in the same action, so a mistyped address
+// never needs two separate admin steps.
+async function editTicketEmail(
+	env: Env,
+	origin: string | null,
+	token: string,
+	newEmail: string,
+): Promise<{ ok: true; emailSent: boolean }> {
+	const accessToken = await getAccessToken(env);
+	await getTicketOrThrow(env, accessToken, token);
+	await updateDocument(env, accessToken, 'tickets/' + token, { attendeeEmail: stringValue(newEmail) }, ['attendeeEmail']);
+	return resendTicketEmail(env, origin, token);
+}
+
+async function markTicketUsed(env: Env, token: string): Promise<{ ok: true }> {
+	const accessToken = await getAccessToken(env);
+	const ticket = await getTicketOrThrow(env, accessToken, token);
+	if (ticket.redeemed === true) {
+		throw new AdminActionError('This ticket has already been used.', 409);
+	}
+	await updateDocument(
+		env,
+		accessToken,
+		'tickets/' + token,
+		{ redeemed: booleanValue(true), redeemedAt: timestampValue(new Date().toISOString()) },
+		['redeemed', 'redeemedAt'],
+	);
+	return { ok: true };
+}
 
 function validateRequest(body: RegisterRequest): string | null {
 	if (!body.eventId || typeof body.eventId !== 'string') {
@@ -418,9 +646,9 @@ async function getDocument(
 	env: Env,
 	accessToken: string,
 	path: string,
-	transactionId: string,
+	transactionId?: string,
 ): Promise<{ fields?: Record<string, unknown> } | null> {
-	const url = firestoreBase(env) + '/' + path + '?transaction=' + encodeURIComponent(transactionId);
+	const url = firestoreBase(env) + '/' + path + (transactionId ? '?transaction=' + encodeURIComponent(transactionId) : '');
 	const response = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } });
 	if (response.status === 404) {
 		return null;
@@ -429,6 +657,30 @@ async function getDocument(
 		throw new Error('Could not read from Firestore: ' + response.status);
 	}
 	return (await response.json()) as { fields?: Record<string, unknown> };
+}
+
+// A single-document update outside any transaction: resend, edit-email and
+// mark-used each touch one ticket in isolation, so the stronger guarantee a
+// transaction gives is not needed the way it is for registration racing
+// against capacity. updateMask limits the write to exactly the fields
+// named, leaving everything else on the document untouched.
+async function updateDocument(
+	env: Env,
+	accessToken: string,
+	path: string,
+	fields: Record<string, unknown>,
+	fieldPaths: string[],
+): Promise<void> {
+	const mask = fieldPaths.map((field) => 'updateMask.fieldPaths=' + encodeURIComponent(field)).join('&');
+	const url = firestoreBase(env) + '/' + path + '?' + mask;
+	const response = await fetch(url, {
+		method: 'PATCH',
+		headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
+		body: JSON.stringify({ fields }),
+	});
+	if (!response.ok) {
+		throw new Error('Could not update Firestore: ' + response.status + ' ' + (await response.text()));
+	}
 }
 
 // Returns true on a clean commit. Returns false specifically for the

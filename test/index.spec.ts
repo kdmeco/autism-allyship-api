@@ -10,9 +10,18 @@ import worker from '../src/index';
 
 const FIRESTORE_ORIGIN = 'https://firestore.googleapis.com';
 const OAUTH_ORIGIN = 'https://oauth2.googleapis.com';
+const GOOGLE_APIS_ORIGIN = 'https://www.googleapis.com';
+const JWKS_PATH = '/robot/v1/metadata/jwk/securetoken@system.gserviceaccount.com';
 const DOCS_PATH = '/v1/projects/autism-allyship/databases/(default)/documents';
 
 let privateKeyPem: string;
+
+// A second, independent RSA pair for admin ID tokens: the upload Worker's
+// test file signs with one key and serves its public half from a mocked
+// JWKS endpoint, and this file does the same thing for the same reason,
+// verifying it is Google's job in production, not this test's.
+let adminSigningKey: CryptoKey;
+let adminVerifyingJwk: JsonWebKey & { kid: string };
 
 beforeAll(async () => {
 	const pair = (await crypto.subtle.generateKey(
@@ -22,6 +31,14 @@ beforeAll(async () => {
 	)) as CryptoKeyPair;
 	const exported = await crypto.subtle.exportKey('pkcs8', pair.privateKey);
 	privateKeyPem = pemWrap(exported);
+
+	const adminPair = (await crypto.subtle.generateKey(
+		{ name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]) },
+		true,
+		['sign', 'verify'],
+	)) as CryptoKeyPair;
+	adminSigningKey = adminPair.privateKey;
+	adminVerifyingJwk = { ...(await crypto.subtle.exportKey('jwk', adminPair.publicKey)), kid: 'test-admin-key' };
 
 	// Registered once, with persist(), the same way the upload Worker's test
 	// file persists its JWKS mock: the Worker's access-token cache means only
@@ -33,7 +50,100 @@ beforeAll(async () => {
 		.intercept({ path: '/token', method: 'POST' })
 		.reply(200, { access_token: 'test-access-token', expires_in: 3600, token_type: 'Bearer' })
 		.persist();
+	fetchMock.get(GOOGLE_APIS_ORIGIN).intercept({ path: JWKS_PATH }).reply(200, { keys: [adminVerifyingJwk] }).persist();
 });
+
+function toBase64Url(bytes: Uint8Array): string {
+	let binary = '';
+	for (const byte of bytes) {
+		binary += String.fromCharCode(byte);
+	}
+	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function encodeJson(value: unknown): string {
+	return toBase64Url(new TextEncoder().encode(JSON.stringify(value)));
+}
+
+async function mintAdminToken(claims: Record<string, unknown> = {}): Promise<string> {
+	const header = encodeJson({ alg: 'RS256', kid: adminVerifyingJwk.kid });
+	const payload = encodeJson({
+		iss: 'https://securetoken.google.com/autism-allyship',
+		aud: 'autism-allyship',
+		exp: Math.floor(Date.now() / 1000) + 3600,
+		sub: 'admin-uid',
+		...claims,
+	});
+	const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', adminSigningKey, new TextEncoder().encode(`${header}.${payload}`));
+	return `${header}.${payload}.${toBase64Url(new Uint8Array(signature))}`;
+}
+
+// Queues the admins/{uid} lookup verifyAdmin() makes once the token itself
+// checks out: found means the caller is an admin, 404 means they are not.
+function mockAdminDoc(uid: string, isAdmin: boolean): void {
+	fetchMock
+		.get(FIRESTORE_ORIGIN)
+		.intercept({ path: DOCS_PATH + '/admins/' + uid, method: 'GET' })
+		.reply(isAdmin ? 200 : 404, isAdmin ? { fields: {} } : { error: { message: 'not found' } });
+}
+
+function mockTicketGet(token: string, ticket: Record<string, unknown> | null): void {
+	fetchMock
+		.get(FIRESTORE_ORIGIN)
+		.intercept({ path: DOCS_PATH + '/tickets/' + token, method: 'GET' })
+		.reply(ticket ? 200 : 404, ticket ? { fields: ticket } : { error: { message: 'not found' } });
+}
+
+// DOCS_PATH contains literal parentheses ("(default)"), which are regex
+// metacharacters: unescaped, they read as a capture group for the text
+// "default" rather than a match for the literal parens Firestore's URL
+// actually has, and the mock silently never matches. Escaped here so the
+// path is matched literally up to the query string, whatever the exact
+// updateMask field order turns out to be.
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function mockTicketPatch(token: string): void {
+	fetchMock
+		.get(FIRESTORE_ORIGIN)
+		.intercept({ path: new RegExp('^' + escapeRegExp(DOCS_PATH + '/tickets/' + token) + '\\?'), method: 'PATCH' })
+		.reply(200, {});
+}
+
+function ticketFields(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		token: firestoreValue('test-token'),
+		eventId: firestoreValue('event-1'),
+		eventTitle: firestoreValue('Test Event'),
+		attendeeName: firestoreValue('Durell Jardim'),
+		attendeeEmail: firestoreValue('durell@example.com'),
+		quantity: firestoreValue(2),
+		price: firestoreValue(0),
+		paystackRef: firestoreValue(''),
+		redeemed: firestoreValue(false),
+		...overrides,
+	};
+}
+
+async function postAdmin(
+	path: string,
+	body: Record<string, unknown>,
+	token: string | null,
+	env: typeof testEnv = testEnv,
+): Promise<Response> {
+	const ctx = createExecutionContext();
+	const headers: Record<string, string> = {
+		'Content-Type': 'application/json',
+		Origin: 'https://staging.autism-allyship.pages.dev',
+	};
+	if (token) {
+		headers.Authorization = 'Bearer ' + token;
+	}
+	const response = await worker.fetch(new Request('https://worker' + path, { method: 'POST', headers, body: JSON.stringify(body) }), env, ctx);
+	await waitOnExecutionContext(ctx);
+	return response;
+}
 
 const testEnv = {
 	FIREBASE_PROJECT_ID: 'autism-allyship',
@@ -370,5 +480,113 @@ describe('the ticket registration endpoint', () => {
 		await waitOnExecutionContext(ctx);
 		expect(response.status).toBe(204);
 		expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://staging.autism-allyship.pages.dev');
+	});
+});
+
+describe('admin attendee actions', () => {
+	it('refuses resend with no Authorization header at all', async () => {
+		const response = await postAdmin('/attendees/resend', { token: 'tok-1' }, null);
+		expect(response.status).toBe(401);
+	});
+
+	it('refuses a signed in user who is not an admin', async () => {
+		mockAdminDoc('admin-uid', false);
+		const token = await mintAdminToken();
+		const response = await postAdmin('/attendees/resend', { token: 'tok-1' }, token);
+		expect(response.status).toBe(401);
+	});
+
+	it('refuses a token signed with the wrong key', async () => {
+		const rogue = (await crypto.subtle.generateKey(
+			{ name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]) },
+			true,
+			['sign', 'verify'],
+		)) as CryptoKeyPair;
+		const header = encodeJson({ alg: 'RS256', kid: adminVerifyingJwk.kid });
+		const payload = encodeJson({
+			iss: 'https://securetoken.google.com/autism-allyship',
+			aud: 'autism-allyship',
+			exp: Math.floor(Date.now() / 1000) + 3600,
+			sub: 'admin-uid',
+		});
+		const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', rogue.privateKey, new TextEncoder().encode(`${header}.${payload}`));
+		const forged = `${header}.${payload}.${toBase64Url(new Uint8Array(signature))}`;
+		const response = await postAdmin('/attendees/resend', { token: 'tok-1' }, forged);
+		expect(response.status).toBe(401);
+	});
+
+	it('rejects resend without a ticket token in the body', async () => {
+		mockAdminDoc('admin-uid', true);
+		const token = await mintAdminToken();
+		const response = await postAdmin('/attendees/resend', {}, token);
+		expect(response.status).toBe(400);
+	});
+
+	it('answers 404 when the ticket does not exist', async () => {
+		mockAdminDoc('admin-uid', true);
+		mockTicketGet('missing-token', null);
+		const token = await mintAdminToken();
+		const response = await postAdmin('/attendees/resend', { token: 'missing-token' }, token);
+		expect(response.status).toBe(404);
+	});
+
+	it('resends the confirmation email for an existing ticket and reports emailSent', async () => {
+		mockAdminDoc('admin-uid', true);
+		mockTicketGet('tok-1', ticketFields());
+		mockBrevo(200);
+		const token = await mintAdminToken();
+		const response = await postAdmin('/attendees/resend', { token: 'tok-1' }, token, envWithBrevo);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.emailSent).toBe(true);
+	});
+
+	it('rejects an edit with an invalid replacement email', async () => {
+		mockAdminDoc('admin-uid', true);
+		const token = await mintAdminToken();
+		const response = await postAdmin('/attendees/edit-email', { token: 'tok-1', newEmail: 'not-an-email' }, token);
+		expect(response.status).toBe(400);
+	});
+
+	it('updates the email and resends to the corrected address', async () => {
+		mockAdminDoc('admin-uid', true);
+		mockTicketGet('tok-1', ticketFields());
+		mockTicketPatch('tok-1');
+		mockTicketGet('tok-1', ticketFields({ attendeeEmail: firestoreValue('corrected@example.com') }));
+		mockBrevo(200);
+		const token = await mintAdminToken();
+		const response = await postAdmin('/attendees/edit-email', { token: 'tok-1', newEmail: 'corrected@example.com' }, token, envWithBrevo);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.emailSent).toBe(true);
+	});
+
+	it('marks an unredeemed ticket used', async () => {
+		mockAdminDoc('admin-uid', true);
+		mockTicketGet('tok-1', ticketFields({ redeemed: firestoreValue(false) }));
+		mockTicketPatch('tok-1');
+		const token = await mintAdminToken();
+		const response = await postAdmin('/attendees/mark-used', { token: 'tok-1' }, token);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean };
+		expect(result.ok).toBe(true);
+	});
+
+	it('refuses to mark an already-redeemed ticket used again', async () => {
+		mockAdminDoc('admin-uid', true);
+		mockTicketGet('tok-1', ticketFields({ redeemed: firestoreValue(true) }));
+		const token = await mintAdminToken();
+		const response = await postAdmin('/attendees/mark-used', { token: 'tok-1' }, token);
+		expect(response.status).toBe(409);
+	});
+
+	it('answers 404 for an admin action on a ticket that does not exist', async () => {
+		mockAdminDoc('admin-uid', true);
+		mockTicketGet('missing-token', null);
+		const token = await mintAdminToken();
+		const response = await postAdmin('/attendees/mark-used', { token: 'missing-token' }, token);
+		expect(response.status).toBe(404);
 	});
 });
