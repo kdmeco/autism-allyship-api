@@ -590,3 +590,91 @@ describe('admin attendee actions', () => {
 		expect(response.status).toBe(404);
 	});
 });
+
+function contactBody(overrides: Record<string, unknown> = {}): string {
+	return JSON.stringify({
+		name: 'Alex Tester',
+		email: 'alex@example.com',
+		phone: '012 345 6789',
+		category: 'General',
+		message: 'Please tell me about upcoming events.',
+		...overrides,
+	});
+}
+
+describe('the contact notify endpoint', () => {
+	it('refuses an origin that is not one of ours', async () => {
+		const response = await post(contactBody(), { Origin: 'https://evil.example' }, '/contact-notify');
+		expect(response.status).toBe(403);
+	});
+
+	it('rejects a malformed JSON body', async () => {
+		const response = await post('{not json', {}, '/contact-notify');
+		expect(response.status).toBe(400);
+	});
+
+	it('rejects a missing name', async () => {
+		const response = await post(contactBody({ name: '' }), {}, '/contact-notify');
+		expect(response.status).toBe(400);
+	});
+
+	it('rejects an invalid email', async () => {
+		const response = await post(contactBody({ email: 'not-an-email' }), {}, '/contact-notify');
+		expect(response.status).toBe(400);
+	});
+
+	it('rejects a missing message', async () => {
+		const response = await post(contactBody({ message: '' }), {}, '/contact-notify');
+		expect(response.status).toBe(400);
+	});
+
+	it('rejects a category that is not one the form stores', async () => {
+		const response = await post(contactBody({ category: 'spam' }), {}, '/contact-notify');
+		expect(response.status).toBe(400);
+	});
+
+	it('sends the notify email and reports emailSent true when Brevo accepts it', async () => {
+		mockBrevo(200);
+		const response = await post(contactBody(), {}, '/contact-notify', envWithBrevo);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.emailSent).toBe(true);
+	});
+
+	it('still returns ok, with emailSent false, when Brevo rejects the request', async () => {
+		mockBrevo(401);
+		const response = await post(contactBody(), {}, '/contact-notify', envWithBrevo);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.emailSent).toBe(false);
+	});
+
+	it('still returns ok, with emailSent false, when no Brevo key is configured', async () => {
+		const response = await post(contactBody(), {}, '/contact-notify');
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.emailSent).toBe(false);
+	});
+
+	it('allows the origin in preflights', async () => {
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(
+			new Request('https://worker/contact-notify', {
+				method: 'OPTIONS',
+				headers: {
+					Origin: 'http://127.0.0.1:5500',
+					'Access-Control-Request-Method': 'POST',
+					'Access-Control-Request-Headers': 'content-type',
+				},
+			}),
+			testEnv,
+			ctx,
+		);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(204);
+		expect(response.headers.get('Access-Control-Allow-Origin')).toBe('http://127.0.0.1:5500');
+	});
+});

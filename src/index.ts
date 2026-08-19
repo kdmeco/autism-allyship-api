@@ -9,13 +9,19 @@ interface Env {
 	FIREBASE_PROJECT_ID: string;
 	FIREBASE_SERVICE_ACCOUNT: string; // secret: the whole downloaded service account JSON key file, as text
 	BREVO_API_KEY?: string; // secret: absent until Section 6's Brevo setup is done, and the confirmation email is skipped rather than failing the registration until then
+	CONTACT_NOTIFY_EMAIL?: string; // secret: foundation inbox, or a personal inbox for the first live test. Falls back to info@autismallyship.org
 }
 
 const TICKET_PATH = '/ticket';
+const CONTACT_NOTIFY_PATH = '/contact-notify';
 const RESEND_PATH = '/attendees/resend';
 const EDIT_EMAIL_PATH = '/attendees/edit-email';
 const MARK_USED_PATH = '/attendees/mark-used';
 const ADMIN_PATHS = [RESEND_PATH, EDIT_EMAIL_PATH, MARK_USED_PATH];
+const DEFAULT_CONTACT_NOTIFY_EMAIL = 'info@autismallyship.org';
+const MAX_MESSAGE_LENGTH = 5000;
+const MAX_PHONE_LENGTH = 40;
+const CONTACT_CATEGORIES = ['General', 'volunteer', 'partnership', 'media', 'resource suggestion', 'accessibility'];
 
 // A family arrives together, per SCHEMA.md's reasoning for why one booking
 // covers a quantity rather than issuing one ticket per person. Past ten this
@@ -37,6 +43,14 @@ interface RegisterRequest {
 	attendeeName: string;
 	attendeeEmail: string;
 	quantity: number;
+}
+
+interface ContactNotifyRequest {
+	name: string;
+	email: string;
+	phone: string;
+	category: string;
+	message: string;
 }
 
 // Same origin policy as the upload Worker: the project's own Pages
@@ -103,6 +117,10 @@ export default {
 			return handleAdminRequest(request, env, origin, pathname);
 		}
 
+		if (pathname === CONTACT_NOTIFY_PATH) {
+			return handleContactNotify(request, env, origin);
+		}
+
 		if (pathname !== TICKET_PATH) {
 			return json({ error: 'Not found' }, 404, origin);
 		}
@@ -146,6 +164,64 @@ export default {
 		}
 	},
 };
+
+// The contact form writes the Firestore document itself. This endpoint only
+// sends the foundation a copy, and must not fail the visitor if mail fails:
+// thank-you on the page means the document exists.
+async function handleContactNotify(request: Request, env: Env, origin: string | null): Promise<Response> {
+	let body: ContactNotifyRequest;
+	try {
+		body = (await request.json()) as ContactNotifyRequest;
+	} catch {
+		return json({ error: 'Invalid JSON body' }, 400, origin);
+	}
+
+	const validationError = validateContactNotify(body);
+	if (validationError) {
+		return json({ error: validationError }, 400, origin);
+	}
+
+	const emailSent = await sendContactNotifyEmail(env, {
+		name: body.name.trim(),
+		email: body.email.trim(),
+		phone: typeof body.phone === 'string' ? body.phone.trim() : '',
+		category: body.category,
+		message: body.message.trim(),
+	});
+
+	return json({ ok: true, emailSent }, 200, origin);
+}
+
+function validateContactNotify(body: ContactNotifyRequest): string | null {
+	if (!body.name || typeof body.name !== 'string' || body.name.trim() === '') {
+		return 'Please enter a name.';
+	}
+	if (body.name.length > MAX_NAME_LENGTH) {
+		return 'That name is too long.';
+	}
+	if (!body.email || typeof body.email !== 'string' || !EMAIL_PATTERN.test(body.email.trim())) {
+		return 'Please enter a valid email address.';
+	}
+	if (body.email.length > MAX_EMAIL_LENGTH) {
+		return 'That email address is too long.';
+	}
+	if (body.phone != null && typeof body.phone !== 'string') {
+		return 'Please enter a valid phone number.';
+	}
+	if (typeof body.phone === 'string' && body.phone.length > MAX_PHONE_LENGTH) {
+		return 'That phone number is too long.';
+	}
+	if (!body.category || typeof body.category !== 'string' || !CONTACT_CATEGORIES.includes(body.category)) {
+		return 'Please choose a category.';
+	}
+	if (!body.message || typeof body.message !== 'string' || body.message.trim() === '') {
+		return 'Please enter a message.';
+	}
+	if (body.message.length > MAX_MESSAGE_LENGTH) {
+		return 'That message is too long.';
+	}
+	return null;
+}
 
 // --- Admin token verification ---
 //
@@ -596,6 +672,60 @@ function buildEmailHtml(input: ConfirmationEmailInput, bookedBy: string, when: s
 
 function escapeHtml(text: string): string {
 	return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function sendContactNotifyEmail(env: Env, input: ContactNotifyRequest): Promise<boolean> {
+	if (!env.BREVO_API_KEY) {
+		return false;
+	}
+
+	const toEmail = env.CONTACT_NOTIFY_EMAIL || DEFAULT_CONTACT_NOTIFY_EMAIL;
+	const phoneLine = input.phone ? input.phone : 'Not given';
+
+	try {
+		const response = await fetch(BREVO_API_URL, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				Accept: 'application/json',
+				'api-key': env.BREVO_API_KEY,
+			},
+			body: JSON.stringify({
+				sender: { name: SENDER_NAME, email: SENDER_EMAIL },
+				to: [{ email: toEmail }],
+				replyTo: { email: input.email, name: input.name },
+				subject: 'Contact form: ' + input.category,
+				htmlContent: [
+					`<p>A message was sent through the website contact form.</p>`,
+					`<p><strong>Category:</strong> ${escapeHtml(input.category)}</p>`,
+					`<p><strong>Name:</strong> ${escapeHtml(input.name)}</p>`,
+					`<p><strong>Email:</strong> ${escapeHtml(input.email)}</p>`,
+					`<p><strong>Phone:</strong> ${escapeHtml(phoneLine)}</p>`,
+					`<p><strong>Message:</strong></p>`,
+					`<p>${escapeHtml(input.message).replace(/\n/g, '<br>')}</p>`,
+				].join('\n'),
+				textContent: [
+					'A message was sent through the website contact form.',
+					'Category: ' + input.category,
+					'Name: ' + input.name,
+					'Email: ' + input.email,
+					'Phone: ' + phoneLine,
+					'',
+					input.message,
+				].join('\n'),
+			}),
+		});
+		if (!response.ok) {
+			// Status only: the request body holds personal information.
+			console.error('Contact notify Brevo send failed:', response.status);
+			return false;
+		}
+		return true;
+	} catch (error) {
+		const code = error instanceof Error ? error.name : 'unknown';
+		console.error('Contact notify Brevo send threw:', code);
+		return false;
+	}
 }
 
 // Twenty random bytes, base64url encoded, comes out to about 27 characters:
