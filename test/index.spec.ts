@@ -338,7 +338,12 @@ function mockDonationPatch(reference: string): void {
 		.reply(200, {});
 }
 
-function mockPaystackVerify(reference: string, status: 200 | 401, paystackStatus: 'success' | 'failed' = 'success'): void {
+function mockPaystackVerify(
+	reference: string,
+	status: 200 | 401,
+	paystackStatus: 'success' | 'failed' = 'success',
+	metadata: Record<string, unknown> = {},
+): void {
 	fetchMock
 		.get(PAYSTACK_ORIGIN)
 		.intercept({ path: '/transaction/verify/' + reference, method: 'GET' })
@@ -348,10 +353,36 @@ function mockPaystackVerify(reference: string, status: 200 | 401, paystackStatus
 				? {
 						status: true,
 						message: 'Verification successful',
-						data: { status: paystackStatus, gateway_response: paystackStatus === 'success' ? 'Successful' : 'Declined' },
+						data: {
+							status: paystackStatus,
+							gateway_response: paystackStatus === 'success' ? 'Successful' : 'Declined',
+							metadata,
+						},
 					}
 				: { status: false, message: 'Invalid key' },
 		);
+}
+
+function paidTicketMetadata(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		ticketToken: 'paid-token-1',
+		eventId: 'event-1',
+		eventTitle: 'Paid Event',
+		eventStartsAt: new Date(Date.now() + 86400000).toISOString(),
+		attendeeName: 'Durell Jardim',
+		attendeeEmail: 'durell@example.com',
+		quantity: '2',
+		unitPrice: '50',
+		amount: '100',
+		...overrides,
+	};
+}
+
+function mockEventGet(event: Record<string, unknown> | null): void {
+	fetchMock
+		.get(FIRESTORE_ORIGIN)
+		.intercept({ path: /\/documents\/events\/.+/, method: 'GET' })
+		.reply(event ? 200 : 404, event ? { fields: event } : { error: { message: 'not found' } });
 }
 
 function firestoreDouble(value: number) {
@@ -922,5 +953,97 @@ describe('the donation verify endpoint', () => {
 		mockPaystackVerify('ref-4', 401);
 		const response = await post(JSON.stringify({ reference: 'ref-4' }), {}, '/donations/verify', envWithPaystack);
 		expect(response.status).toBe(502);
+	});
+});
+
+describe('the ticket initialize endpoint', () => {
+	it('refuses an origin that is not one of ours', async () => {
+		const response = await post(registerBody(), { Origin: 'https://evil.example' }, '/tickets/initialize');
+		expect(response.status).toBe(403);
+	});
+
+	it('rejects a missing name', async () => {
+		const response = await post(registerBody({ attendeeName: '' }), {}, '/tickets/initialize');
+		expect(response.status).toBe(400);
+	});
+
+	it('refuses a free event', async () => {
+		mockEventGet(eventFields({ isTicketed: false, price: 0 }));
+		const response = await post(registerBody(), {}, '/tickets/initialize', envWithPaystack);
+		expect(response.status).toBe(400);
+	});
+
+	it('refuses a sold-out paid event', async () => {
+		mockEventGet(eventFields({ isTicketed: true, price: 50, capacity: 2, ticketsSold: 2 }));
+		const response = await post(registerBody(), {}, '/tickets/initialize', envWithPaystack);
+		expect(response.status).toBe(409);
+	});
+
+	it('returns 502 when Paystack refuses to initialize', async () => {
+		mockEventGet(eventFields({ isTicketed: true, price: 50 }));
+		mockPaystackInitialize(401);
+		const response = await post(registerBody(), {}, '/tickets/initialize', envWithPaystack);
+		expect(response.status).toBe(502);
+	});
+
+	it('returns the access code, reference and amount for a paid event', async () => {
+		mockEventGet(eventFields({ isTicketed: true, price: 50 }));
+		mockPaystackInitialize(200, 'ticket-ref-1');
+		const response = await post(registerBody(), {}, '/tickets/initialize', envWithPaystack);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; accessCode: string; reference: string; amount: number };
+		expect(result.ok).toBe(true);
+		expect(result.accessCode).toBe('access-1');
+		expect(result.reference).toBe('ticket-ref-1');
+		expect(result.amount).toBe(100);
+	});
+});
+
+describe('the ticket verify endpoint', () => {
+	it('rejects a missing reference', async () => {
+		const response = await post(JSON.stringify({}), {}, '/tickets/verify');
+		expect(response.status).toBe(400);
+	});
+
+	it('returns failed without creating a ticket when Paystack declines', async () => {
+		mockPaystackVerify('ticket-ref-fail', 200, 'failed', paidTicketMetadata());
+		const response = await post(JSON.stringify({ reference: 'ticket-ref-fail' }), {}, '/tickets/verify', envWithPaystack);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; status: string; token?: string };
+		expect(result.status).toBe('failed');
+		expect(result.token).toBeUndefined();
+	});
+
+	it('creates a ticket and returns the token on a successful payment', async () => {
+		const metadata = paidTicketMetadata();
+		mockPaystackVerify('ticket-ref-ok', 200, 'success', metadata);
+		mockTicketGet('paid-token-1', null);
+		mockAttempt({ result: 'committed', event: eventFields({ isTicketed: true, price: 50, ticketsSold: 0 }) });
+		const response = await post(JSON.stringify({ reference: 'ticket-ref-ok' }), {}, '/tickets/verify', envWithPaystack);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; status: string; token: string; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.status).toBe('success');
+		expect(result.token).toBe('paid-token-1');
+		expect(result.emailSent).toBe(false);
+	});
+
+	it('returns the existing token without writing again when the ticket already exists', async () => {
+		const metadata = paidTicketMetadata();
+		mockPaystackVerify('ticket-ref-again', 200, 'success', metadata);
+		mockTicketGet(
+			'paid-token-1',
+			ticketFields({
+				token: firestoreValue('paid-token-1'),
+				eventTitle: firestoreValue('Paid Event'),
+				paystackRef: firestoreValue('ticket-ref-again'),
+				price: firestoreDouble(100),
+			}),
+		);
+		const response = await post(JSON.stringify({ reference: 'ticket-ref-again' }), {}, '/tickets/verify', envWithPaystack);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; status: string; token: string };
+		expect(result.status).toBe('success');
+		expect(result.token).toBe('paid-token-1');
 	});
 });
