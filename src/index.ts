@@ -22,6 +22,14 @@ const ADMIN_PATHS = [RESEND_PATH, EDIT_EMAIL_PATH, MARK_USED_PATH];
 const DONATE_INITIALIZE_PATH = '/donations/initialize';
 const DONATE_VERIFY_PATH = '/donations/verify';
 const DEFAULT_CONTACT_NOTIFY_EMAIL = 'info@autismallyship.org';
+
+// Origin doubles as "where should the emailed ticket link point", so a
+// registration from the staging preview gets a staging link and one from
+// production gets a production link. A native app sends no Origin header at
+// all, so there is nothing to build a link from; this is what it falls back
+// to. Matches the address TicketDetailActivity.kt already hardcodes as
+// TICKET_URL_BASE on the app side.
+const DEFAULT_TICKET_BASE_URL = 'https://autism-allyship.pages.dev';
 const MAX_MESSAGE_LENGTH = 5000;
 const MAX_PHONE_LENGTH = 40;
 const CONTACT_CATEGORIES = ['General', 'volunteer', 'partnership', 'media', 'resource suggestion', 'accessibility'];
@@ -40,6 +48,20 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // collision here is expected under load, not a bug, and is worth one retry
 // before giving up.
 const MAX_TRANSACTION_ATTEMPTS = 3;
+
+// South Africa does not observe daylight saving, so the offset is fixed and
+// never needs a timezone database. The app and website both treat an event
+// as upcoming until 23:59:59.999 on the day it starts, in whichever zone the
+// visitor's device is in, which for this audience is always SAST; this
+// endpoint has no device to ask, so it assumes the one zone the foundation
+// actually operates in rather than the server's own UTC.
+const SAST_OFFSET_MS = 2 * 60 * 60 * 1000;
+
+function endOfDaySast(date: Date): Date {
+	const sast = new Date(date.getTime() + SAST_OFFSET_MS);
+	const endOfDayUtcMs = Date.UTC(sast.getUTCFullYear(), sast.getUTCMonth(), sast.getUTCDate(), 23, 59, 59, 999) - SAST_OFFSET_MS;
+	return new Date(endOfDayUtcMs);
+}
 
 interface RegisterRequest {
 	eventId: string;
@@ -169,7 +191,7 @@ export default {
 			// already exists by the time this runs, and the visitor already has
 			// the link on screen. The page is told honestly whether it went out,
 			// rather than the response claiming success unconditionally.
-			const ticketUrl = origin + '/ticket.html?token=' + encodeURIComponent(result.token);
+			const ticketUrl = (origin || DEFAULT_TICKET_BASE_URL) + '/ticket.html?token=' + encodeURIComponent(result.token);
 			const emailSent = await sendConfirmationEmail(env, {
 				ticketUrl,
 				eventTitle: result.eventTitle,
@@ -594,7 +616,7 @@ async function resendTicketEmail(env: Env, origin: string | null, token: string)
 	const accessToken = await getAccessToken(env);
 	const ticket = await getTicketOrThrow(env, accessToken, token);
 	const emailSent = await sendConfirmationEmail(env, {
-		ticketUrl: origin + '/ticket.html?token=' + encodeURIComponent(token),
+		ticketUrl: (origin || DEFAULT_TICKET_BASE_URL) + '/ticket.html?token=' + encodeURIComponent(token),
 		eventTitle: typeof ticket.eventTitle === 'string' ? ticket.eventTitle : 'the event',
 		eventStartsAt: typeof ticket.eventStartsAt === 'string' ? ticket.eventStartsAt : null,
 		attendeeName: typeof ticket.attendeeName === 'string' ? ticket.attendeeName : '',
@@ -693,7 +715,11 @@ async function registerTicket(env: Env, body: RegisterRequest): Promise<Register
 			await rollback(env, accessToken, transactionId);
 			return { error: 'That event could not be found.', status: 404 };
 		}
-		if (!startsAt || Number.isNaN(startsAt.getTime()) || startsAt.getTime() <= Date.now()) {
+		// Upcoming until the end of the day it starts, not until the instant it
+		// starts: the app and website both list an event as upcoming right up
+		// to midnight, and this endpoint refusing a registration for something
+		// they are still showing as bookable would be a contradiction.
+		if (!startsAt || Number.isNaN(startsAt.getTime()) || endOfDaySast(startsAt).getTime() < Date.now()) {
 			await rollback(env, accessToken, transactionId);
 			return { error: 'This event has already happened.', status: 400 };
 		}

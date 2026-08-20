@@ -447,6 +447,19 @@ describe('the ticket registration endpoint', () => {
 		expect(response.status).toBe(400);
 	});
 
+	// The app and website both list an event as upcoming until 23:59:59.999
+	// on the day it starts, not until the instant startsAt passes, so this
+	// endpoint has to agree or a real picnic goer registers for something the
+	// app still shows as bookable and gets told it already happened. One
+	// minute ago is always both "in the past" (so this exercises the same
+	// branch the bug lived in) and "earlier today" unless the test happens to
+	// run in the first minute after midnight SAST.
+	it('allows registering for an event that started earlier today', async () => {
+		mockAttempt({ event: eventFields({ startsAt: new Date(Date.now() - 60000).toISOString() }), result: 'committed' });
+		const response = await post(registerBody());
+		expect(response.status).toBe(200);
+	});
+
 	it('refuses a ticketed event, since this endpoint only issues free tickets', async () => {
 		mockAttempt({ event: eventFields({ isTicketed: true }), result: 'refused' });
 		const response = await post(registerBody());
@@ -518,6 +531,39 @@ describe('the ticket registration endpoint', () => {
 		expect(result.ok).toBe(true);
 		expect(result.token).toBeTruthy();
 		expect(result.emailSent).toBe(false);
+	});
+
+	// A native app sends no Origin header at all, unlike a browser, so there
+	// is nothing to build the emailed ticket link from. Before this was
+	// fixed the link came out as "null/ticket.html?token=...": the app could
+	// register a free ticket, but the confirmation email it caused pointed
+	// nowhere. Inspecting the Brevo call is the only way to see the link,
+	// since the JSON response back to the caller never includes it.
+	it('falls back to the production ticket link when the caller sends no Origin header', async () => {
+		mockAttempt({ event: eventFields({ capacity: 10, ticketsSold: 3 }), result: 'committed' });
+		let brevoBody = '';
+		fetchMock
+			.get(BREVO_ORIGIN)
+			.intercept({ path: '/v3/smtp/email', method: 'POST' })
+			.reply(200, ({ body }) => {
+				brevoBody = String(body);
+				return { messageId: 'test-message-id' };
+			});
+
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(
+			new Request('https://worker/ticket', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: registerBody(),
+			}),
+			envWithBrevo,
+			ctx,
+		);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+		expect(brevoBody).toContain('https://autism-allyship.pages.dev/ticket.html?token=');
 	});
 
 	it('gives two registrations different tokens', async () => {
