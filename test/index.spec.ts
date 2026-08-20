@@ -288,6 +288,88 @@ function mockBrevo(status: 200 | 401): void {
 		.reply(status, status === 200 ? { messageId: 'test-message-id' } : { message: 'Key not found' });
 }
 
+const PAYSTACK_ORIGIN = 'https://api.paystack.co';
+const envWithPaystack = { ...testEnv, PAYSTACK_SECRET_KEY: 'sk_test_123' };
+
+function donateBody(overrides: Record<string, unknown> = {}): string {
+	return JSON.stringify({
+		amount: 150,
+		donorName: 'Durell Jardim',
+		donorEmail: 'durell@example.com',
+		message: '',
+		...overrides,
+	});
+}
+
+function mockPaystackInitialize(status: 200 | 401, reference = 'ref-1'): void {
+	fetchMock
+		.get(PAYSTACK_ORIGIN)
+		.intercept({ path: '/transaction/initialize', method: 'POST' })
+		.reply(
+			status,
+			status === 200
+				? {
+						status: true,
+						message: 'Authorization URL created',
+						data: { authorization_url: 'https://checkout.paystack.com/x', access_code: 'access-1', reference },
+					}
+				: { status: false, message: 'Invalid key' },
+		);
+}
+
+function mockDonationCreate(reference: string): void {
+	fetchMock
+		.get(FIRESTORE_ORIGIN)
+		.intercept({ path: new RegExp('^' + escapeRegExp(DOCS_PATH + '/donations') + '\\?documentId=' + escapeRegExp(reference)), method: 'POST' })
+		.reply(200, {});
+}
+
+function mockDonationGet(reference: string, donation: Record<string, unknown> | null): void {
+	fetchMock
+		.get(FIRESTORE_ORIGIN)
+		.intercept({ path: DOCS_PATH + '/donations/' + reference, method: 'GET' })
+		.reply(donation ? 200 : 404, donation ? { fields: donation } : { error: { message: 'not found' } });
+}
+
+function mockDonationPatch(reference: string): void {
+	fetchMock
+		.get(FIRESTORE_ORIGIN)
+		.intercept({ path: new RegExp('^' + escapeRegExp(DOCS_PATH + '/donations/' + reference) + '\\?'), method: 'PATCH' })
+		.reply(200, {});
+}
+
+function mockPaystackVerify(reference: string, status: 200 | 401, paystackStatus: 'success' | 'failed' = 'success'): void {
+	fetchMock
+		.get(PAYSTACK_ORIGIN)
+		.intercept({ path: '/transaction/verify/' + reference, method: 'GET' })
+		.reply(
+			status,
+			status === 200
+				? {
+						status: true,
+						message: 'Verification successful',
+						data: { status: paystackStatus, gateway_response: paystackStatus === 'success' ? 'Successful' : 'Declined' },
+					}
+				: { status: false, message: 'Invalid key' },
+		);
+}
+
+function firestoreDouble(value: number) {
+	return { doubleValue: value };
+}
+
+function donationFields(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		amount: firestoreDouble(150),
+		donorName: firestoreValue('Durell Jardim'),
+		donorEmail: firestoreValue('durell@example.com'),
+		message: firestoreValue(''),
+		paystackRef: firestoreValue('ref-1'),
+		status: firestoreValue('pending'),
+		...overrides,
+	};
+}
+
 describe('the ticket registration endpoint', () => {
 	// The tests in this block are all rejected during input validation,
 	// before registerTicket() ever calls Firestore. They deliberately do not
@@ -676,5 +758,123 @@ describe('the contact notify endpoint', () => {
 		await waitOnExecutionContext(ctx);
 		expect(response.status).toBe(204);
 		expect(response.headers.get('Access-Control-Allow-Origin')).toBe('http://127.0.0.1:5500');
+	});
+});
+
+describe('the donation initialize endpoint', () => {
+	it('refuses an origin that is not one of ours', async () => {
+		const response = await post(donateBody(), { Origin: 'https://evil.example' }, '/donations/initialize');
+		expect(response.status).toBe(403);
+	});
+
+	it('rejects a malformed JSON body', async () => {
+		const response = await post('{not json', {}, '/donations/initialize');
+		expect(response.status).toBe(400);
+	});
+
+	it('rejects an amount of zero', async () => {
+		const response = await post(donateBody({ amount: 0 }), {}, '/donations/initialize');
+		expect(response.status).toBe(400);
+	});
+
+	it('rejects a missing name', async () => {
+		const response = await post(donateBody({ donorName: '' }), {}, '/donations/initialize');
+		expect(response.status).toBe(400);
+	});
+
+	it('rejects an invalid email', async () => {
+		const response = await post(donateBody({ donorEmail: 'not-an-email' }), {}, '/donations/initialize');
+		expect(response.status).toBe(400);
+	});
+
+	it('returns 502 when Paystack refuses to initialize the transaction', async () => {
+		mockPaystackInitialize(401);
+		const response = await post(donateBody(), {}, '/donations/initialize', envWithPaystack);
+		expect(response.status).toBe(502);
+	});
+
+	it('creates a pending donation record and returns the access code and reference', async () => {
+		mockPaystackInitialize(200, 'ref-1');
+		mockDonationCreate('ref-1');
+		const response = await post(donateBody(), {}, '/donations/initialize', envWithPaystack);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; accessCode: string; reference: string };
+		expect(result.ok).toBe(true);
+		expect(result.accessCode).toBe('access-1');
+		expect(result.reference).toBe('ref-1');
+	});
+
+
+	it('allows the origin in preflights', async () => {
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(
+			new Request('https://worker/donations/initialize', {
+				method: 'OPTIONS',
+				headers: {
+					Origin: 'https://staging.autism-allyship.pages.dev',
+					'Access-Control-Request-Method': 'POST',
+					'Access-Control-Request-Headers': 'content-type',
+				},
+			}),
+			testEnv,
+			ctx,
+		);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(204);
+		expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://staging.autism-allyship.pages.dev');
+	});
+});
+
+describe('the donation verify endpoint', () => {
+	it('rejects a missing reference', async () => {
+		const response = await post(JSON.stringify({}), {}, '/donations/verify');
+		expect(response.status).toBe(400);
+	});
+
+	it('answers 404 when the donation does not exist', async () => {
+		mockDonationGet('missing-ref', null);
+		const response = await post(JSON.stringify({ reference: 'missing-ref' }), {}, '/donations/verify', envWithPaystack);
+		expect(response.status).toBe(404);
+	});
+
+	it('confirms a successful payment and marks the donation successful', async () => {
+		mockDonationGet('ref-1', donationFields());
+		mockPaystackVerify('ref-1', 200, 'success');
+		mockDonationPatch('ref-1');
+		const response = await post(JSON.stringify({ reference: 'ref-1' }), {}, '/donations/verify', envWithPaystack);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; status: string; amount: number; donorName: string };
+		expect(result.ok).toBe(true);
+		expect(result.status).toBe('success');
+		expect(result.amount).toBe(150);
+		expect(result.donorName).toBe('Durell Jardim');
+	});
+
+	it('marks a declined payment as failed', async () => {
+		mockDonationGet('ref-2', donationFields({ paystackRef: firestoreValue('ref-2') }));
+		mockPaystackVerify('ref-2', 200, 'failed');
+		mockDonationPatch('ref-2');
+		const response = await post(JSON.stringify({ reference: 'ref-2' }), {}, '/donations/verify', envWithPaystack);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; status: string };
+		expect(result.status).toBe('failed');
+	});
+
+	it('does not call Paystack again for a donation already resolved', async () => {
+		mockDonationGet('ref-3', donationFields({ status: firestoreValue('success') }));
+		// No mockPaystackVerify() call: fetchMock's disableNetConnect() from
+		// beforeEach fails this test if the code asks Paystack again for a
+		// donation that was already resolved by an earlier call.
+		const response = await post(JSON.stringify({ reference: 'ref-3' }), {}, '/donations/verify', envWithPaystack);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; status: string };
+		expect(result.status).toBe('success');
+	});
+
+	it('returns 502 when Paystack cannot verify the transaction', async () => {
+		mockDonationGet('ref-4', donationFields());
+		mockPaystackVerify('ref-4', 401);
+		const response = await post(JSON.stringify({ reference: 'ref-4' }), {}, '/donations/verify', envWithPaystack);
+		expect(response.status).toBe(502);
 	});
 });
