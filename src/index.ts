@@ -1,15 +1,16 @@
-// Public API Worker for the Autism Allyship Foundation site. Starts with one
-// endpoint, free-event ticket registration, and is the intended home for the
-// Paystack and Brevo endpoints once those sections are built. Kept separate
-// from the image upload Worker because this endpoint is called anonymously
-// by any visitor, and the upload Worker holds a GitHub token with full repo
-// scope: an anonymous route has no business sharing a process with that.
+// Public API Worker for the Autism Allyship Foundation site. Free-event
+// ticket registration, the contact notify mail, the admin attendee actions,
+// and now the Paystack donation flow. Kept separate from the image upload
+// Worker because this endpoint is called anonymously by any visitor, and the
+// upload Worker holds a GitHub token with full repo scope: an anonymous
+// route has no business sharing a process with that.
 
 interface Env {
 	FIREBASE_PROJECT_ID: string;
 	FIREBASE_SERVICE_ACCOUNT: string; // secret: the whole downloaded service account JSON key file, as text
 	BREVO_API_KEY?: string; // secret: absent until Section 6's Brevo setup is done, and the confirmation email is skipped rather than failing the registration until then
 	CONTACT_NOTIFY_EMAIL?: string; // secret: foundation inbox, or a personal inbox for the first live test. Falls back to info@autismallyship.org
+	PAYSTACK_SECRET_KEY: string; // secret: the Paystack South Africa account's secret key, see CONSOLE-STEPS.md. Both donation endpoints fail cleanly with a 502 until this is set, the same as calling Paystack with any other wrong key would
 }
 
 const TICKET_PATH = '/ticket';
@@ -18,6 +19,8 @@ const RESEND_PATH = '/attendees/resend';
 const EDIT_EMAIL_PATH = '/attendees/edit-email';
 const MARK_USED_PATH = '/attendees/mark-used';
 const ADMIN_PATHS = [RESEND_PATH, EDIT_EMAIL_PATH, MARK_USED_PATH];
+const DONATE_INITIALIZE_PATH = '/donations/initialize';
+const DONATE_VERIFY_PATH = '/donations/verify';
 const DEFAULT_CONTACT_NOTIFY_EMAIL = 'info@autismallyship.org';
 const MAX_MESSAGE_LENGTH = 5000;
 const MAX_PHONE_LENGTH = 40;
@@ -51,6 +54,17 @@ interface ContactNotifyRequest {
 	phone: string;
 	category: string;
 	message: string;
+}
+
+interface DonationInitializeRequest {
+	amount: number;
+	donorName: string;
+	donorEmail: string;
+	message?: string;
+}
+
+interface DonationVerifyRequest {
+	reference: string;
 }
 
 // Same origin policy as the upload Worker: the project's own Pages
@@ -119,6 +133,14 @@ export default {
 
 		if (pathname === CONTACT_NOTIFY_PATH) {
 			return handleContactNotify(request, env, origin);
+		}
+
+		if (pathname === DONATE_INITIALIZE_PATH) {
+			return handleDonationInitialize(request, env, origin);
+		}
+
+		if (pathname === DONATE_VERIFY_PATH) {
+			return handleDonationVerify(request, env, origin);
 		}
 
 		if (pathname !== TICKET_PATH) {
@@ -221,6 +243,177 @@ function validateContactNotify(body: ContactNotifyRequest): string | null {
 		return 'That message is too long.';
 	}
 	return null;
+}
+
+// --- Donations ---
+//
+// Two requests either side of the Paystack popup. Initialize creates the
+// Paystack transaction and a matching Firestore document with status
+// "pending", using the reference Paystack generates as the document ID, the
+// same reasoning DECISIONS.md gives for tickets: it is not guessable, and
+// storing it as the ID rather than a field means verify can read and update
+// the right document directly rather than needing a query. Verify then
+// confirms the outcome with Paystack and flips that one field. The amount,
+// donor details and message are trusted from the initial request and never
+// re-read from Paystack afterwards, because resumeTransaction() only ever
+// resumes the exact transaction initialize created: nothing in the popup
+// lets a visitor change the amount that was already sent to Paystack.
+//
+// Every donation is a single one-off transaction. A monthly/recurring option
+// existed briefly and was removed: the foundation does not want it, so
+// there is no Paystack Plan, no Subscription, and nothing to rebill.
+const PAYSTACK_INITIALIZE_URL = 'https://api.paystack.co/transaction/initialize';
+const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify/';
+const DONATION_CURRENCY = 'ZAR';
+
+function validateDonationInitialize(body: DonationInitializeRequest): string | null {
+	if (typeof body.amount !== 'number' || !Number.isFinite(body.amount) || body.amount <= 0) {
+		return 'Choose a donation amount greater than R0.';
+	}
+	if (!body.donorName || typeof body.donorName !== 'string' || body.donorName.trim() === '') {
+		return 'Please enter your name.';
+	}
+	if (body.donorName.length > MAX_NAME_LENGTH) {
+		return 'That name is too long.';
+	}
+	if (!body.donorEmail || typeof body.donorEmail !== 'string' || !EMAIL_PATTERN.test(body.donorEmail.trim())) {
+		return 'Please enter a valid email address.';
+	}
+	if (body.donorEmail.length > MAX_EMAIL_LENGTH) {
+		return 'That email address is too long.';
+	}
+	if (body.message != null && typeof body.message !== 'string') {
+		return 'That message is not valid.';
+	}
+	if (typeof body.message === 'string' && body.message.length > MAX_MESSAGE_LENGTH) {
+		return 'That message is too long.';
+	}
+	return null;
+}
+
+async function handleDonationInitialize(request: Request, env: Env, origin: string | null): Promise<Response> {
+	let body: DonationInitializeRequest;
+	try {
+		body = (await request.json()) as DonationInitializeRequest;
+	} catch {
+		return json({ error: 'Invalid JSON body' }, 400, origin);
+	}
+
+	const validationError = validateDonationInitialize(body);
+	if (validationError) {
+		return json({ error: validationError }, 400, origin);
+	}
+
+	const donorName = body.donorName.trim();
+	const donorEmail = body.donorEmail.trim();
+	const message = typeof body.message === 'string' ? body.message.trim() : '';
+
+	try {
+		const paystackResponse = await fetch(PAYSTACK_INITIALIZE_URL, {
+			method: 'POST',
+			headers: {
+				Authorization: 'Bearer ' + env.PAYSTACK_SECRET_KEY,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				email: donorEmail,
+				amount: Math.round(body.amount * 100),
+				currency: DONATION_CURRENCY,
+			}),
+		});
+		const paystackData = (await paystackResponse.json()) as {
+			status: boolean;
+			message?: string;
+			data?: { access_code: string; reference: string };
+		};
+
+		if (!paystackResponse.ok || !paystackData.status || !paystackData.data) {
+			console.error('Paystack initialize failed:', paystackResponse.status, paystackData.message);
+			return json({ error: 'Could not start the donation. Try again.' }, 502, origin);
+		}
+
+		const { access_code: accessCode, reference } = paystackData.data;
+
+		const accessToken = await getAccessToken(env);
+		await createDocument(env, accessToken, 'donations', reference, {
+			amount: doubleValue(body.amount),
+			donorName: stringValue(donorName),
+			donorEmail: stringValue(donorEmail),
+			message: stringValue(message),
+			paystackRef: stringValue(reference),
+			status: stringValue('pending'),
+			createdAt: timestampValue(new Date().toISOString()),
+		});
+
+		return json({ ok: true, accessCode, reference }, 200, origin);
+	} catch (error) {
+		console.error('Donation initialize failed:', error);
+		return json({ error: 'Could not start the donation. Try again.' }, 500, origin);
+	}
+}
+
+function donationSummary(reference: string, donation: Record<string, unknown>, gatewayResponse?: string) {
+	return {
+		ok: true,
+		reference,
+		status: typeof donation.status === 'string' ? donation.status : 'pending',
+		amount: typeof donation.amount === 'number' ? donation.amount : 0,
+		donorName: typeof donation.donorName === 'string' ? donation.donorName : '',
+		...(gatewayResponse ? { gatewayResponse } : {}),
+	};
+}
+
+async function handleDonationVerify(request: Request, env: Env, origin: string | null): Promise<Response> {
+	let body: DonationVerifyRequest;
+	try {
+		body = (await request.json()) as DonationVerifyRequest;
+	} catch {
+		return json({ error: 'Invalid JSON body' }, 400, origin);
+	}
+
+	const reference = typeof body.reference === 'string' ? body.reference.trim() : '';
+	if (!reference) {
+		return json({ error: 'A payment reference is required.' }, 400, origin);
+	}
+
+	try {
+		const accessToken = await getAccessToken(env);
+		const existingDoc = await getDocument(env, accessToken, 'donations/' + reference);
+		if (!existingDoc) {
+			return json({ error: 'That donation could not be found.' }, 404, origin);
+		}
+		const existing = parseFields(existingDoc.fields || {});
+
+		// Already resolved by an earlier call, most likely the visitor
+		// reloading the success page. Paystack is not asked again: a
+		// completed transaction's status does not change on a second look,
+		// and this keeps a page refresh from spending another verify call.
+		if (existing.status !== 'pending') {
+			return json(donationSummary(reference, existing), 200, origin);
+		}
+
+		const verifyResponse = await fetch(PAYSTACK_VERIFY_URL + encodeURIComponent(reference), {
+			headers: { Authorization: 'Bearer ' + env.PAYSTACK_SECRET_KEY },
+		});
+		const verifyData = (await verifyResponse.json()) as {
+			status: boolean;
+			message?: string;
+			data?: { status: string; gateway_response: string };
+		};
+
+		if (!verifyResponse.ok || !verifyData.status || !verifyData.data) {
+			console.error('Paystack verify failed:', verifyResponse.status, verifyData.message);
+			return json({ error: 'Could not confirm that payment. Try again shortly.' }, 502, origin);
+		}
+
+		const resolvedStatus = verifyData.data.status === 'success' ? 'success' : 'failed';
+		await updateDocument(env, accessToken, 'donations/' + reference, { status: stringValue(resolvedStatus) }, ['status']);
+
+		return json(donationSummary(reference, { ...existing, status: resolvedStatus }, verifyData.data.gateway_response), 200, origin);
+	} catch (error) {
+		console.error('Donation verify failed:', error);
+		return json({ error: 'Could not confirm that payment. Try again shortly.' }, 500, origin);
+	}
 }
 
 // --- Admin token verification ---
@@ -813,6 +1006,22 @@ async function updateDocument(
 	}
 }
 
+// Creates a document with a caller-chosen ID outside any transaction, used
+// for the donation record so its ID can be the Paystack reference. Fails
+// with a 409 if that ID is already taken, which is a free guard against
+// ever writing the same donation twice.
+async function createDocument(env: Env, accessToken: string, collectionPath: string, documentId: string, fields: Record<string, unknown>): Promise<void> {
+	const url = firestoreBase(env) + '/' + collectionPath + '?documentId=' + encodeURIComponent(documentId);
+	const response = await fetch(url, {
+		method: 'POST',
+		headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
+		body: JSON.stringify({ fields }),
+	});
+	if (!response.ok) {
+		throw new Error('Could not create the Firestore document: ' + response.status + ' ' + (await response.text()));
+	}
+}
+
 // Returns true on a clean commit. Returns false specifically for the
 // concurrency conflict (Firestore answers 409 ABORTED), which the caller
 // retries. Any other failure is a real error and throws.
@@ -851,6 +1060,9 @@ function stringValue(value: string) {
 }
 function integerValue(value: number) {
 	return { integerValue: String(Math.trunc(value)) };
+}
+function doubleValue(value: number) {
+	return { doubleValue: value };
 }
 function booleanValue(value: boolean) {
 	return { booleanValue: value };
