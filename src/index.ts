@@ -721,6 +721,20 @@ function paystackMetadataObject(raw: unknown): Record<string, unknown> {
 	return result;
 }
 
+// The browser keeps the reference and offers to check again while Paystack
+// is still working. Only conclusive outcomes clear that saved reference.
+// Unknown statuses stay pending so a new Paystack value cannot accidentally
+// turn a payment that may still complete into a failed booking.
+function normalizedTicketPaymentStatus(status: string): 'success' | 'failed' | 'pending' {
+	if (status === 'success') {
+		return 'success';
+	}
+	if (status === 'failed' || status === 'abandoned' || status === 'reversed') {
+		return 'failed';
+	}
+	return 'pending';
+}
+
 async function handleTicketVerify(request: Request, env: Env, origin: string | null): Promise<Response> {
 	let body: TicketVerifyRequest;
 	try {
@@ -753,12 +767,12 @@ async function handleTicketVerify(request: Request, env: Env, origin: string | n
 			return json({ error: 'Could not confirm that payment. Try again shortly.' }, 502, origin);
 		}
 
-		const paystackStatus = verifyData.data.status === 'success' ? 'success' : 'failed';
+		const paystackStatus = normalizedTicketPaymentStatus(verifyData.data.status);
 		if (paystackStatus !== 'success') {
 			return json(
 				{
 					ok: true,
-					status: 'failed',
+					status: paystackStatus,
 					reference,
 					gatewayResponse: verifyData.data.gateway_response,
 				},

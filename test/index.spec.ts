@@ -341,7 +341,7 @@ function mockDonationPatch(reference: string): void {
 function mockPaystackVerify(
 	reference: string,
 	status: 200 | 401,
-	paystackStatus: 'success' | 'failed' = 'success',
+	paystackStatus: 'success' | 'failed' | 'abandoned' | 'reversed' | 'ongoing' | 'pending' | 'processing' | 'queued' | 'unknown' = 'success',
 	metadata: Record<string, unknown> = {},
 ): void {
 	fetchMock
@@ -1013,6 +1013,37 @@ describe('the ticket verify endpoint', () => {
 		expect(result.status).toBe('failed');
 		expect(result.token).toBeUndefined();
 	});
+
+	it.each(['abandoned', 'reversed'] as const)('normalizes the terminal %s status to failed', async (paystackStatus) => {
+		mockPaystackVerify('ticket-ref-' + paystackStatus, 200, paystackStatus, paidTicketMetadata());
+		const response = await post(
+			JSON.stringify({ reference: 'ticket-ref-' + paystackStatus }),
+			{},
+			'/tickets/verify',
+			envWithPaystack,
+		);
+		const result = (await response.json()) as { ok: boolean; status: string; token?: string };
+		expect(response.status).toBe(200);
+		expect(result.status).toBe('failed');
+		expect(result.token).toBeUndefined();
+	});
+
+	it.each(['ongoing', 'pending', 'processing', 'queued', 'unknown'] as const)(
+		'normalizes the unresolved %s status to pending',
+		async (paystackStatus) => {
+			mockPaystackVerify('ticket-ref-' + paystackStatus, 200, paystackStatus, paidTicketMetadata());
+			const response = await post(
+				JSON.stringify({ reference: 'ticket-ref-' + paystackStatus }),
+				{},
+				'/tickets/verify',
+				envWithPaystack,
+			);
+			const result = (await response.json()) as { ok: boolean; status: string; token?: string };
+			expect(response.status).toBe(200);
+			expect(result.status).toBe('pending');
+			expect(result.token).toBeUndefined();
+		},
+	);
 
 	it('creates a ticket and returns the token on a successful payment', async () => {
 		const metadata = paidTicketMetadata();
