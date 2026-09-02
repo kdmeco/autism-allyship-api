@@ -1,7 +1,6 @@
-// Public API Worker for the Autism Allyship Foundation site. Free-event
-// ticket registration, paid-event Paystack checkout (initialize + verify),
-// the contact notify mail, the admin attendee actions, and the Paystack
-// donation flow. Kept separate from the image upload Worker because this
+// Public API Worker for the Autism Allyship Foundation site. Event ticket
+// registration, the contact notify mail, and the admin attendee actions.
+// Kept separate from the image upload Worker because this
 // endpoint is called anonymously by any visitor, and the upload Worker holds
 // a GitHub token with full repo scope: an anonymous route has no business
 // sharing a process with that.
@@ -11,19 +10,14 @@ interface Env {
 	FIREBASE_SERVICE_ACCOUNT: string; // secret: the whole downloaded service account JSON key file, as text
 	BREVO_API_KEY?: string; // secret: absent until Section 6's Brevo setup is done, and the confirmation email is skipped rather than failing the registration until then
 	CONTACT_NOTIFY_EMAIL?: string; // secret: foundation inbox, or a personal inbox for the first live test. Falls back to info@autismallyship.org
-	PAYSTACK_SECRET_KEY: string; // secret: the Paystack South Africa account's secret key, see CONSOLE-STEPS.md. Both donation endpoints fail cleanly with a 502 until this is set, the same as calling Paystack with any other wrong key would
 }
 
 const TICKET_PATH = '/ticket';
-const TICKET_INITIALIZE_PATH = '/tickets/initialize';
-const TICKET_VERIFY_PATH = '/tickets/verify';
 const CONTACT_NOTIFY_PATH = '/contact-notify';
 const RESEND_PATH = '/attendees/resend';
 const EDIT_EMAIL_PATH = '/attendees/edit-email';
 const MARK_USED_PATH = '/attendees/mark-used';
 const ADMIN_PATHS = [RESEND_PATH, EDIT_EMAIL_PATH, MARK_USED_PATH];
-const DONATE_INITIALIZE_PATH = '/donations/initialize';
-const DONATE_VERIFY_PATH = '/donations/verify';
 const DEFAULT_CONTACT_NOTIFY_EMAIL = 'info@autismallyship.org';
 
 // Origin doubles as "where should the emailed ticket link point", so a
@@ -79,17 +73,6 @@ interface ContactNotifyRequest {
 	phone: string;
 	category: string;
 	message: string;
-}
-
-interface DonationInitializeRequest {
-	amount: number;
-	donorName: string;
-	donorEmail: string;
-	message?: string;
-}
-
-interface DonationVerifyRequest {
-	reference: string;
 }
 
 // Same origin policy as the upload Worker: the project's own Pages
@@ -158,22 +141,6 @@ export default {
 
 		if (pathname === CONTACT_NOTIFY_PATH) {
 			return handleContactNotify(request, env, origin);
-		}
-
-		if (pathname === DONATE_INITIALIZE_PATH) {
-			return handleDonationInitialize(request, env, origin);
-		}
-
-		if (pathname === DONATE_VERIFY_PATH) {
-			return handleDonationVerify(request, env, origin);
-		}
-
-		if (pathname === TICKET_INITIALIZE_PATH) {
-			return handleTicketInitialize(request, env, origin);
-		}
-
-		if (pathname === TICKET_VERIFY_PATH) {
-			return handleTicketVerify(request, env, origin);
 		}
 
 		if (pathname !== TICKET_PATH) {
@@ -278,552 +245,6 @@ function validateContactNotify(body: ContactNotifyRequest): string | null {
 	return null;
 }
 
-// --- Donations ---
-//
-// Two requests either side of the Paystack popup. Initialize creates the
-// Paystack transaction and a matching Firestore document with status
-// "pending", using the reference Paystack generates as the document ID, the
-// same reasoning DECISIONS.md gives for tickets: it is not guessable, and
-// storing it as the ID rather than a field means verify can read and update
-// the right document directly rather than needing a query. Verify then
-// confirms the outcome with Paystack and flips that one field. The amount,
-// donor details and message are trusted from the initial request and never
-// re-read from Paystack afterwards, because resumeTransaction() only ever
-// resumes the exact transaction initialize created: nothing in the popup
-// lets a visitor change the amount that was already sent to Paystack.
-//
-// Every donation is a single one-off transaction. A monthly/recurring option
-// existed briefly and was removed: the foundation does not want it, so
-// there is no Paystack Plan, no Subscription, and nothing to rebill.
-const PAYSTACK_INITIALIZE_URL = 'https://api.paystack.co/transaction/initialize';
-const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify/';
-const DONATION_CURRENCY = 'ZAR';
-
-function validateDonationInitialize(body: DonationInitializeRequest): string | null {
-	if (typeof body.amount !== 'number' || !Number.isFinite(body.amount) || body.amount <= 0) {
-		return 'Choose a donation amount greater than R0.';
-	}
-	if (!body.donorName || typeof body.donorName !== 'string' || body.donorName.trim() === '') {
-		return 'Please enter your name.';
-	}
-	if (body.donorName.length > MAX_NAME_LENGTH) {
-		return 'That name is too long.';
-	}
-	if (!body.donorEmail || typeof body.donorEmail !== 'string' || !EMAIL_PATTERN.test(body.donorEmail.trim())) {
-		return 'Please enter a valid email address.';
-	}
-	if (body.donorEmail.length > MAX_EMAIL_LENGTH) {
-		return 'That email address is too long.';
-	}
-	if (body.message != null && typeof body.message !== 'string') {
-		return 'That message is not valid.';
-	}
-	if (typeof body.message === 'string' && body.message.length > MAX_MESSAGE_LENGTH) {
-		return 'That message is too long.';
-	}
-	return null;
-}
-
-async function handleDonationInitialize(request: Request, env: Env, origin: string | null): Promise<Response> {
-	let body: DonationInitializeRequest;
-	try {
-		body = (await request.json()) as DonationInitializeRequest;
-	} catch {
-		return json({ error: 'Invalid JSON body' }, 400, origin);
-	}
-
-	const validationError = validateDonationInitialize(body);
-	if (validationError) {
-		return json({ error: validationError }, 400, origin);
-	}
-
-	const donorName = body.donorName.trim();
-	const donorEmail = body.donorEmail.trim();
-	const message = typeof body.message === 'string' ? body.message.trim() : '';
-
-	try {
-		const paystackResponse = await fetch(PAYSTACK_INITIALIZE_URL, {
-			method: 'POST',
-			headers: {
-				Authorization: 'Bearer ' + env.PAYSTACK_SECRET_KEY,
-				'Content-Type': 'application/json',
-			},
-			body: JSON.stringify({
-				email: donorEmail,
-				amount: Math.round(body.amount * 100),
-				currency: DONATION_CURRENCY,
-			}),
-		});
-		const paystackData = (await paystackResponse.json()) as {
-			status: boolean;
-			message?: string;
-			data?: { access_code: string; reference: string };
-		};
-
-		if (!paystackResponse.ok || !paystackData.status || !paystackData.data) {
-			console.error('Paystack initialize failed:', paystackResponse.status, paystackData.message);
-			return json({ error: 'Could not start the donation. Try again.' }, 502, origin);
-		}
-
-		const { access_code: accessCode, reference } = paystackData.data;
-
-		const accessToken = await getAccessToken(env);
-		await createDocument(env, accessToken, 'donations', reference, {
-			amount: doubleValue(body.amount),
-			donorName: stringValue(donorName),
-			donorEmail: stringValue(donorEmail),
-			message: stringValue(message),
-			paystackRef: stringValue(reference),
-			status: stringValue('pending'),
-			createdAt: timestampValue(new Date().toISOString()),
-		});
-
-		return json({ ok: true, accessCode, reference }, 200, origin);
-	} catch (error) {
-		console.error('Donation initialize failed:', error);
-		return json({ error: 'Could not start the donation. Try again.' }, 500, origin);
-	}
-}
-
-function donationSummary(reference: string, donation: Record<string, unknown>, gatewayResponse?: string) {
-	return {
-		ok: true,
-		reference,
-		status: typeof donation.status === 'string' ? donation.status : 'pending',
-		amount: typeof donation.amount === 'number' ? donation.amount : 0,
-		donorName: typeof donation.donorName === 'string' ? donation.donorName : '',
-		...(gatewayResponse ? { gatewayResponse } : {}),
-	};
-}
-
-async function handleDonationVerify(request: Request, env: Env, origin: string | null): Promise<Response> {
-	let body: DonationVerifyRequest;
-	try {
-		body = (await request.json()) as DonationVerifyRequest;
-	} catch {
-		return json({ error: 'Invalid JSON body' }, 400, origin);
-	}
-
-	const reference = typeof body.reference === 'string' ? body.reference.trim() : '';
-	if (!reference) {
-		return json({ error: 'A payment reference is required.' }, 400, origin);
-	}
-
-	try {
-		const accessToken = await getAccessToken(env);
-		const existingDoc = await getDocument(env, accessToken, 'donations/' + reference);
-		if (!existingDoc) {
-			return json({ error: 'That donation could not be found.' }, 404, origin);
-		}
-		const existing = parseFields(existingDoc.fields || {});
-
-		// Already resolved by an earlier call, most likely the visitor
-		// reloading the success page. Paystack is not asked again: a
-		// completed transaction's status does not change on a second look,
-		// and this keeps a page refresh from spending another verify call.
-		if (existing.status !== 'pending') {
-			return json(donationSummary(reference, existing), 200, origin);
-		}
-
-		const verifyResponse = await fetch(PAYSTACK_VERIFY_URL + encodeURIComponent(reference), {
-			headers: { Authorization: 'Bearer ' + env.PAYSTACK_SECRET_KEY },
-		});
-		const verifyData = (await verifyResponse.json()) as {
-			status: boolean;
-			message?: string;
-			data?: { status: string; gateway_response: string };
-		};
-
-		if (!verifyResponse.ok || !verifyData.status || !verifyData.data) {
-			console.error('Paystack verify failed:', verifyResponse.status, verifyData.message);
-			return json({ error: 'Could not confirm that payment. Try again shortly.' }, 502, origin);
-		}
-
-		const resolvedStatus = verifyData.data.status === 'success' ? 'success' : 'failed';
-		await updateDocument(env, accessToken, 'donations/' + reference, { status: stringValue(resolvedStatus) }, ['status']);
-
-		return json(donationSummary(reference, { ...existing, status: resolvedStatus }, verifyData.data.gateway_response), 200, origin);
-	} catch (error) {
-		console.error('Donation verify failed:', error);
-		return json({ error: 'Could not confirm that payment. Try again shortly.' }, 500, origin);
-	}
-}
-
-// Paid tickets mirror donations: initialize with Paystack, verify before
-// writing a ticket. Booking details and the eventual ticket document ID ride
-// in Paystack metadata so there is no pending Firestore collection and no
-// list query on tickets (rules allow get by ID, not list). Free registration
-// stays on POST /ticket and still refuses isTicketed events.
-
-interface TicketVerifyRequest {
-	reference: string;
-}
-
-async function loadBookablePaidEvent(
-	env: Env,
-	accessToken: string,
-	eventId: string,
-	quantity: number,
-): Promise<{ event: Record<string, unknown>; unitPrice: number; amount: number } | { error: string; status: number }> {
-	const eventDoc = await getDocument(env, accessToken, 'events/' + eventId);
-	if (!eventDoc) {
-		return { error: 'That event could not be found.', status: 404 };
-	}
-
-	const event = parseFields(eventDoc.fields || {});
-	const published = event.published === true;
-	const isTicketed = event.isTicketed === true;
-	const startsAt = typeof event.startsAt === 'string' ? new Date(event.startsAt) : null;
-	const capacity = typeof event.capacity === 'number' ? event.capacity : 0;
-	const ticketsSold = typeof event.ticketsSold === 'number' ? event.ticketsSold : 0;
-	const unitPrice = typeof event.price === 'number' ? event.price : 0;
-
-	if (!published) {
-		return { error: 'That event could not be found.', status: 404 };
-	}
-	if (!startsAt || Number.isNaN(startsAt.getTime()) || endOfDaySast(startsAt).getTime() < Date.now()) {
-		return { error: 'This event has already happened.', status: 400 };
-	}
-	if (!isTicketed || unitPrice <= 0) {
-		return { error: 'This event does not require payment. Register without paying.', status: 400 };
-	}
-
-	const newTotal = ticketsSold + quantity;
-	if (capacity !== 0 && newTotal > capacity) {
-		const remaining = Math.max(capacity - ticketsSold, 0);
-		return {
-			error: remaining === 0 ? 'This event is sold out.' : 'Only ' + remaining + ' ' + (remaining === 1 ? 'spot' : 'spots') + ' left.',
-			status: 409,
-		};
-	}
-
-	return { event, unitPrice, amount: unitPrice * quantity };
-}
-
-async function handleTicketInitialize(request: Request, env: Env, origin: string | null): Promise<Response> {
-	let body: RegisterRequest;
-	try {
-		body = (await request.json()) as RegisterRequest;
-	} catch {
-		return json({ error: 'Invalid JSON body' }, 400, origin);
-	}
-
-	const validationError = validateRequest(body);
-	if (validationError) {
-		return json({ error: validationError }, 400, origin);
-	}
-
-	const attendeeName = body.attendeeName.trim();
-	const attendeeEmail = body.attendeeEmail.trim();
-
-	try {
-		const accessToken = await getAccessToken(env);
-		const loaded = await loadBookablePaidEvent(env, accessToken, body.eventId, body.quantity);
-		if ('error' in loaded) {
-			return json({ error: loaded.error }, loaded.status, origin);
-		}
-
-		const { event, unitPrice, amount } = loaded;
-		const eventTitle = typeof event.title === 'string' ? event.title : 'Untitled';
-		const eventStartsAt = typeof event.startsAt === 'string' ? event.startsAt : '';
-		// Chosen before Paystack so verify can create tickets/{ticketToken}
-		// without listing the collection. Nothing is written to Firestore yet.
-		const ticketToken = generateToken();
-
-		const paystackResponse = await fetch(PAYSTACK_INITIALIZE_URL, {
-			method: 'POST',
-			headers: {
-				Authorization: 'Bearer ' + env.PAYSTACK_SECRET_KEY,
-				'Content-Type': 'application/json',
-			},
-			body: JSON.stringify({
-				email: attendeeEmail,
-				amount: Math.round(amount * 100),
-				currency: DONATION_CURRENCY,
-				metadata: {
-					ticketToken,
-					eventId: body.eventId,
-					eventTitle,
-					eventStartsAt,
-					attendeeName,
-					attendeeEmail,
-					quantity: String(body.quantity),
-					unitPrice: String(unitPrice),
-					amount: String(amount),
-				},
-			}),
-		});
-		const paystackData = (await paystackResponse.json()) as {
-			status: boolean;
-			message?: string;
-			data?: { access_code: string; reference: string };
-		};
-
-		if (!paystackResponse.ok || !paystackData.status || !paystackData.data) {
-			console.error('Paystack ticket initialize failed:', paystackResponse.status, paystackData.message);
-			return json({ error: 'Could not start the payment. Try again.' }, 502, origin);
-		}
-
-		const { access_code: accessCode, reference } = paystackData.data;
-		return json({ ok: true, accessCode, reference, amount }, 200, origin);
-	} catch (error) {
-		console.error('Ticket initialize failed:', error);
-		return json({ error: 'Could not start the payment. Try again.' }, 500, origin);
-	}
-}
-
-type PaidTicketCreateResult =
-	| { token: string; eventTitle: string; eventStartsAt: string | null; attendeeName: string; attendeeEmail: string; quantity: number }
-	| { error: string; status: number };
-
-// Creates the ticket inside a Firestore transaction the same way free
-// registration does, so two paid bookings racing for the last seats cannot
-// both succeed. Payment has already succeeded by the time this runs; if
-// capacity is gone the visitor still gets a ticket (money was taken) and
-// ticketsSold is allowed past capacity rather than leaving them paid with
-// nothing to show at the door.
-async function createPaidTicketFromMetadata(
-	env: Env,
-	metadata: Record<string, unknown>,
-	reference: string,
-): Promise<PaidTicketCreateResult> {
-	const ticketToken = typeof metadata.ticketToken === 'string' ? metadata.ticketToken : '';
-	const eventId = typeof metadata.eventId === 'string' ? metadata.eventId : '';
-	const attendeeName = typeof metadata.attendeeName === 'string' ? metadata.attendeeName : '';
-	const attendeeEmail = typeof metadata.attendeeEmail === 'string' ? metadata.attendeeEmail : '';
-	const quantityRaw = metadata.quantity;
-	const quantity =
-		typeof quantityRaw === 'number'
-			? quantityRaw
-			: typeof quantityRaw === 'string'
-				? parseInt(quantityRaw, 10)
-				: NaN;
-	const amountRaw = metadata.amount;
-	const amount =
-		typeof amountRaw === 'number'
-			? amountRaw
-			: typeof amountRaw === 'string'
-				? parseFloat(amountRaw)
-				: NaN;
-
-	if (!ticketToken || !eventId || !attendeeName || !attendeeEmail || !Number.isInteger(quantity) || quantity < 1 || !Number.isFinite(amount)) {
-		return { error: 'That payment is missing booking details. Contact the foundation with your reference.', status: 502 };
-	}
-
-	const accessToken = await getAccessToken(env);
-
-	// Idempotent: a reload of the success page must not create a second ticket.
-	const existingTicket = await getDocument(env, accessToken, 'tickets/' + ticketToken);
-	if (existingTicket) {
-		const existing = parseFields(existingTicket.fields || {});
-		return {
-			token: ticketToken,
-			eventTitle: typeof existing.eventTitle === 'string' ? existing.eventTitle : 'Untitled',
-			eventStartsAt: typeof existing.eventStartsAt === 'string' ? existing.eventStartsAt : null,
-			attendeeName: typeof existing.attendeeName === 'string' ? existing.attendeeName : attendeeName,
-			attendeeEmail: typeof existing.attendeeEmail === 'string' ? existing.attendeeEmail : attendeeEmail,
-			quantity: typeof existing.quantity === 'number' ? existing.quantity : quantity,
-		};
-	}
-
-	for (let attempt = 1; attempt <= MAX_TRANSACTION_ATTEMPTS; attempt++) {
-		const transactionId = await beginTransaction(env, accessToken);
-		const eventDoc = await getDocument(env, accessToken, 'events/' + eventId, transactionId);
-		if (!eventDoc) {
-			await rollback(env, accessToken, transactionId);
-			return { error: 'That event could not be found.', status: 404 };
-		}
-
-		const event = parseFields(eventDoc.fields || {});
-		const ticketsSold = typeof event.ticketsSold === 'number' ? event.ticketsSold : 0;
-		const eventTitle = typeof event.title === 'string' ? event.title : typeof metadata.eventTitle === 'string' ? metadata.eventTitle : 'Untitled';
-		const eventStartsAt =
-			typeof event.startsAt === 'string'
-				? event.startsAt
-				: typeof metadata.eventStartsAt === 'string' && metadata.eventStartsAt
-					? metadata.eventStartsAt
-					: null;
-		const newTotal = ticketsSold + quantity;
-
-		const writes = [
-			{
-				update: {
-					name: documentName(env, 'events/' + eventId),
-					fields: { ticketsSold: integerValue(newTotal) },
-				},
-				updateMask: { fieldPaths: ['ticketsSold'] },
-			},
-			{
-				update: {
-					name: documentName(env, 'tickets/' + ticketToken),
-					fields: {
-						token: stringValue(ticketToken),
-						eventId: stringValue(eventId),
-						eventTitle: stringValue(eventTitle),
-						...(eventStartsAt ? { eventStartsAt: timestampValue(eventStartsAt) } : {}),
-						attendeeName: stringValue(attendeeName),
-						attendeeEmail: stringValue(attendeeEmail),
-						quantity: integerValue(quantity),
-						price: doubleValue(amount),
-						paystackRef: stringValue(reference),
-						redeemed: booleanValue(false),
-					},
-				},
-				currentDocument: { exists: false },
-			},
-		];
-
-		try {
-			const committed = await commit(env, accessToken, transactionId, writes);
-			if (committed) {
-				return { token: ticketToken, eventTitle, eventStartsAt, attendeeName, attendeeEmail, quantity };
-			}
-		} catch (error) {
-			// A parallel verify already created this ticket (currentDocument
-			// exists: false failed). Treat it as success rather than leaving
-			// a paid visitor without a token.
-			const raced = await getDocument(env, accessToken, 'tickets/' + ticketToken);
-			if (raced) {
-				return {
-					token: ticketToken,
-					eventTitle,
-					eventStartsAt,
-					attendeeName,
-					attendeeEmail,
-					quantity,
-				};
-			}
-			throw error;
-		}
-	}
-
-	return { error: 'Could not complete the booking, please try again.', status: 409 };
-}
-
-function paystackMetadataObject(raw: unknown): Record<string, unknown> {
-	if (!raw || typeof raw !== 'object') {
-		return {};
-	}
-	const asRecord = raw as Record<string, unknown>;
-	// Paystack sometimes returns metadata as { custom_fields: [...] } plus
-	// flat keys; prefer flat string keys we sent on initialize.
-	const result: Record<string, unknown> = { ...asRecord };
-	if (Array.isArray(asRecord.custom_fields)) {
-		for (const field of asRecord.custom_fields) {
-			if (field && typeof field === 'object') {
-				const entry = field as { variable_name?: string; value?: unknown };
-				if (typeof entry.variable_name === 'string') {
-					result[entry.variable_name] = entry.value;
-				}
-			}
-		}
-	}
-	return result;
-}
-
-// The browser keeps the reference and offers to check again while Paystack
-// is still working. Only conclusive outcomes clear that saved reference.
-// Unknown statuses stay pending so a new Paystack value cannot accidentally
-// turn a payment that may still complete into a failed booking.
-function normalizedTicketPaymentStatus(status: string): 'success' | 'failed' | 'pending' {
-	if (status === 'success') {
-		return 'success';
-	}
-	if (status === 'failed' || status === 'abandoned' || status === 'reversed') {
-		return 'failed';
-	}
-	return 'pending';
-}
-
-async function handleTicketVerify(request: Request, env: Env, origin: string | null): Promise<Response> {
-	let body: TicketVerifyRequest;
-	try {
-		body = (await request.json()) as TicketVerifyRequest;
-	} catch {
-		return json({ error: 'Invalid JSON body' }, 400, origin);
-	}
-
-	const reference = typeof body.reference === 'string' ? body.reference.trim() : '';
-	if (!reference) {
-		return json({ error: 'A payment reference is required.' }, 400, origin);
-	}
-
-	try {
-		const verifyResponse = await fetch(PAYSTACK_VERIFY_URL + encodeURIComponent(reference), {
-			headers: { Authorization: 'Bearer ' + env.PAYSTACK_SECRET_KEY },
-		});
-		const verifyData = (await verifyResponse.json()) as {
-			status: boolean;
-			message?: string;
-			data?: {
-				status: string;
-				gateway_response: string;
-				metadata?: unknown;
-			};
-		};
-
-		if (!verifyResponse.ok || !verifyData.status || !verifyData.data) {
-			console.error('Paystack ticket verify failed:', verifyResponse.status, verifyData.message);
-			return json({ error: 'Could not confirm that payment. Try again shortly.' }, 502, origin);
-		}
-
-		const paystackStatus = normalizedTicketPaymentStatus(verifyData.data.status);
-		if (paystackStatus !== 'success') {
-			return json(
-				{
-					ok: true,
-					status: paystackStatus,
-					reference,
-					gatewayResponse: verifyData.data.gateway_response,
-				},
-				200,
-				origin,
-			);
-		}
-
-		const metadata = paystackMetadataObject(verifyData.data.metadata);
-		const created = await createPaidTicketFromMetadata(env, metadata, reference);
-		if ('error' in created) {
-			return json({ error: created.error }, created.status, origin);
-		}
-
-		const ticketUrl = (origin || DEFAULT_TICKET_BASE_URL) + '/ticket.html?token=' + encodeURIComponent(created.token);
-		const emailSent = await sendConfirmationEmail(env, {
-			ticketUrl,
-			eventTitle: created.eventTitle,
-			eventStartsAt: created.eventStartsAt,
-			attendeeName: created.attendeeName,
-			attendeeEmail: created.attendeeEmail,
-			quantity: created.quantity,
-		});
-
-		return json(
-			{
-				ok: true,
-				status: 'success',
-				reference,
-				token: created.token,
-				emailSent,
-				gatewayResponse: verifyData.data.gateway_response,
-			},
-			200,
-			origin,
-		);
-	} catch (error) {
-		console.error('Ticket verify failed:', error);
-		return json({ error: 'Could not confirm that payment. Try again shortly.' }, 500, origin);
-	}
-}
-
-// --- Admin token verification ---
-//
-// Checks the Firebase ID token the same way the upload Worker does: RS256
-// signature against Google's public keys, then issuer, audience, expiry.
-// From there this Worker diverges: rather than a hardcoded ADMIN_UIDS
-// secret, it checks the admins/{uid} collection directly, the same source
-// of truth every Firestore security rule's isAdmin() already reads.
-// Revoking someone is deleting that document, same as everywhere else, no
-// second list to keep in sync.
 const JWKS_URL = 'https://www.googleapis.com/robot/v1/metadata/jwk/securetoken@system.gserviceaccount.com';
 const JWKS_CACHE_MS = 60 * 60 * 1000;
 type SigningKey = JsonWebKey & { kid?: string };
@@ -1083,7 +504,7 @@ async function registerTicket(env: Env, body: RegisterRequest): Promise<Register
 
 		const event = parseFields(eventDoc.fields || {});
 		const published = event.published === true;
-		const isTicketed = event.isTicketed === true;
+		const eventPrice = typeof event.price === 'number' ? event.price : 0;
 		const startsAt = typeof event.startsAt === 'string' ? new Date(event.startsAt) : null;
 		const capacity = typeof event.capacity === 'number' ? event.capacity : 0;
 		const ticketsSold = typeof event.ticketsSold === 'number' ? event.ticketsSold : 0;
@@ -1100,13 +521,6 @@ async function registerTicket(env: Env, body: RegisterRequest): Promise<Register
 			await rollback(env, accessToken, transactionId);
 			return { error: 'This event has already happened.', status: 400 };
 		}
-		if (isTicketed) {
-			// Paid events use /tickets/initialize and /tickets/verify against
-			// Paystack. This endpoint only ever issues free tickets.
-			await rollback(env, accessToken, transactionId);
-			return { error: 'This event requires payment. Use the paid checkout on the event page.', status: 400 };
-		}
-
 		const newTotal = ticketsSold + body.quantity;
 		if (capacity !== 0 && newTotal > capacity) {
 			await rollback(env, accessToken, transactionId);
@@ -1140,8 +554,7 @@ async function registerTicket(env: Env, body: RegisterRequest): Promise<Register
 						attendeeName: stringValue(body.attendeeName.trim()),
 						attendeeEmail: stringValue(body.attendeeEmail.trim()),
 						quantity: integerValue(body.quantity),
-						price: integerValue(0),
-						paystackRef: stringValue(''),
+						price: integerValue(eventPrice),
 						redeemed: booleanValue(false),
 					},
 				},
@@ -1409,10 +822,9 @@ async function updateDocument(
 	}
 }
 
-// Creates a document with a caller-chosen ID outside any transaction, used
-// for the donation record so its ID can be the Paystack reference. Fails
-// with a 409 if that ID is already taken, which is a free guard against
-// ever writing the same donation twice.
+// Creates a document with a caller-chosen ID outside any transaction. Fails
+// with a 409 if that ID is already taken, which is a free guard against ever
+// writing the same document twice.
 async function createDocument(env: Env, accessToken: string, collectionPath: string, documentId: string, fields: Record<string, unknown>): Promise<void> {
 	const url = firestoreBase(env) + '/' + collectionPath + '?documentId=' + encodeURIComponent(documentId);
 	const response = await fetch(url, {
