@@ -835,21 +835,6 @@ async function updateDocument(
 	}
 }
 
-// Creates a document with a caller-chosen ID outside any transaction. Fails
-// with a 409 if that ID is already taken, which is a free guard against ever
-// writing the same document twice.
-async function createDocument(env: Env, accessToken: string, collectionPath: string, documentId: string, fields: Record<string, unknown>): Promise<void> {
-	const url = firestoreBase(env) + '/' + collectionPath + '?documentId=' + encodeURIComponent(documentId);
-	const response = await fetch(url, {
-		method: 'POST',
-		headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
-		body: JSON.stringify({ fields }),
-	});
-	if (!response.ok) {
-		throw new Error('Could not create the Firestore document: ' + response.status + ' ' + (await response.text()));
-	}
-}
-
 // Returns true on a clean commit. Returns false specifically for the
 // concurrency conflict (Firestore answers 409 ABORTED), which the caller
 // retries. Any other failure is a real error and throws.
