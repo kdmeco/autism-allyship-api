@@ -563,7 +563,11 @@ async function registerTicket(env: Env, body: RegisterRequest): Promise<Register
 						attendeeName: stringValue(body.attendeeName.trim()),
 						attendeeEmail: stringValue(body.attendeeEmail.trim()),
 						quantity: integerValue(body.quantity),
-						price: integerValue(eventPrice),
+						// integerValue truncates, and an event can carry a price
+						// such as R49.99: only a whole number goes out as an
+						// integer, so the ticket records what the attendee
+						// actually owes.
+						price: Number.isInteger(eventPrice) ? integerValue(eventPrice) : doubleValue(eventPrice),
 						redeemed: booleanValue(false),
 					},
 				},
