@@ -347,6 +347,16 @@ describe('the ticket registration endpoint', () => {
 		expect(response.status).toBe(400);
 	});
 
+	// Like the validation tests above, no mockAttempt(): the refusal has to
+	// happen before any Firestore call, and fetchMock's disableNetConnect()
+	// fails this test outright if the id ever reaches Google. A "/" in the id
+	// would otherwise be concatenated into a document path of the caller's
+	// choosing.
+	it('rejects an eventId that is not a plain document id', async () => {
+		const response = await post(registerBody({ eventId: 'events/picnic' }));
+		expect(response.status).toBe(400);
+	});
+
 	it('refuses an event that does not exist', async () => {
 		mockAttempt('missing');
 		const response = await post(registerBody());
@@ -386,6 +396,40 @@ describe('the ticket registration endpoint', () => {
 		mockAttempt({ event: eventFields({ isTicketed: true, price: 150 }), result: 'committed' });
 		const response = await post(registerBody());
 		expect(response.status).toBe(200);
+	});
+
+	// The commit mock captures its own request body the same way the Origin
+	// test below captures the Brevo body, because the ticket document this
+	// creates is otherwise invisible: the JSON response never includes it.
+	// The attempt is registered by hand rather than through mockAttempt(),
+	// so the capturing commit mock is the one and only commit interceptor
+	// queued for this test.
+	it('writes a fractional event price as a double rather than a truncated integer', async () => {
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':beginTransaction', method: 'POST' })
+			.reply(200, { transaction: 'txn-1' });
+		const event = eventFields({ isTicketed: true });
+		// Firestore stores a fractional number as doubleValue; the test
+		// helpers wrap every number as integerValue, which would read back
+		// truncated before the fix ever ran.
+		event.price = { doubleValue: 49.99 };
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: /\/documents\/events\/.+/, method: 'GET' })
+			.reply(200, { fields: event });
+		let commitBody = '';
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':commit', method: 'POST' })
+			.reply(200, ({ body }) => {
+				commitBody = String(body);
+				return {};
+			});
+
+		const response = await post(registerBody());
+		expect(response.status).toBe(200);
+		expect(commitBody).toContain('"price":{"doubleValue":49.99}');
 	});
 
 	it('refuses a quantity that would exceed remaining capacity', async () => {
