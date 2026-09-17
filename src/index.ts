@@ -39,6 +39,12 @@ const MAX_NAME_LENGTH = 200;
 const MAX_EMAIL_LENGTH = 320; // the longest an email address can be under RFC 5321
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// The eventId is concatenated straight into a Firestore document path, so
+// only a plain document id is acceptable: a value carrying "/" or any other
+// character outside this set would reach Google as a path of the caller's
+// choosing rather than an id at all.
+const EVENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
 // Optimistic concurrency: Firestore aborts the commit if another request
 // touched the same event document between our read and our write. Two
 // people registering for the last seat at once must not both succeed, so a
@@ -457,6 +463,9 @@ async function markTicketUsed(env: Env, token: string): Promise<{ ok: true }> {
 
 function validateRequest(body: RegisterRequest): string | null {
 	if (!body.eventId || typeof body.eventId !== 'string') {
+		return 'An event is required.';
+	}
+	if (!EVENT_ID_PATTERN.test(body.eventId)) {
 		return 'An event is required.';
 	}
 	if (!body.attendeeName || typeof body.attendeeName !== 'string' || body.attendeeName.trim() === '') {
