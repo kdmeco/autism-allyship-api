@@ -683,6 +683,24 @@ describe('the contact notify endpoint', () => {
 		expect(response.status).toBe(400);
 	});
 
+	it('accepts the speaking engagement category and sends the notify email', async () => {
+		mockBrevo(200);
+		const response = await post(contactBody({ category: 'speaking engagement' }), {}, '/contact-notify', envWithBrevo);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.emailSent).toBe(true);
+	});
+
+	it('accepts the Donation category and sends the notify email', async () => {
+		mockBrevo(200);
+		const response = await post(contactBody({ category: 'Donation' }), {}, '/contact-notify', envWithBrevo);
+		expect(response.status).toBe(200);
+		const result = (await response.json()) as { ok: boolean; emailSent: boolean };
+		expect(result.ok).toBe(true);
+		expect(result.emailSent).toBe(true);
+	});
+
 	it('sends the notify email and reports emailSent true when Brevo accepts it', async () => {
 		mockBrevo(200);
 		const response = await post(contactBody(), {}, '/contact-notify', envWithBrevo);

@@ -29,7 +29,7 @@ const DEFAULT_CONTACT_NOTIFY_EMAIL = 'info@autismallyship.org';
 const DEFAULT_TICKET_BASE_URL = 'https://autism-allyship.pages.dev';
 const MAX_MESSAGE_LENGTH = 5000;
 const MAX_PHONE_LENGTH = 40;
-const CONTACT_CATEGORIES = ['General', 'volunteer', 'partnership', 'media', 'resource suggestion', 'accessibility'];
+const CONTACT_CATEGORIES = ['General', 'volunteer', 'partnership', 'media', 'resource suggestion', 'accessibility', 'speaking engagement', 'Donation'];
 
 // A family arrives together, per SCHEMA.md's reasoning for why one booking
 // covers a quantity rather than issuing one ticket per person. Past ten this
