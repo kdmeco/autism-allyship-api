@@ -39,6 +39,12 @@ const MAX_NAME_LENGTH = 200;
 const MAX_EMAIL_LENGTH = 320; // the longest an email address can be under RFC 5321
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// The eventId is concatenated straight into a Firestore document path, so
+// only a plain document id is acceptable: a value carrying "/" or any other
+// character outside this set would reach Google as a path of the caller's
+// choosing rather than an id at all.
+const EVENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
 // Optimistic concurrency: Firestore aborts the commit if another request
 // touched the same event document between our read and our write. Two
 // people registering for the last seat at once must not both succeed, so a
@@ -459,6 +465,9 @@ function validateRequest(body: RegisterRequest): string | null {
 	if (!body.eventId || typeof body.eventId !== 'string') {
 		return 'An event is required.';
 	}
+	if (!EVENT_ID_PATTERN.test(body.eventId)) {
+		return 'An event is required.';
+	}
 	if (!body.attendeeName || typeof body.attendeeName !== 'string' || body.attendeeName.trim() === '') {
 		return 'Please enter a name.';
 	}
@@ -554,7 +563,11 @@ async function registerTicket(env: Env, body: RegisterRequest): Promise<Register
 						attendeeName: stringValue(body.attendeeName.trim()),
 						attendeeEmail: stringValue(body.attendeeEmail.trim()),
 						quantity: integerValue(body.quantity),
-						price: integerValue(eventPrice),
+						// integerValue truncates, and an event can carry a price
+						// such as R49.99: only a whole number goes out as an
+						// integer, so the ticket records what the attendee
+						// actually owes.
+						price: Number.isInteger(eventPrice) ? integerValue(eventPrice) : doubleValue(eventPrice),
 						redeemed: booleanValue(false),
 					},
 				},
@@ -819,21 +832,6 @@ async function updateDocument(
 	});
 	if (!response.ok) {
 		throw new Error('Could not update Firestore: ' + response.status + ' ' + (await response.text()));
-	}
-}
-
-// Creates a document with a caller-chosen ID outside any transaction. Fails
-// with a 409 if that ID is already taken, which is a free guard against ever
-// writing the same document twice.
-async function createDocument(env: Env, accessToken: string, collectionPath: string, documentId: string, fields: Record<string, unknown>): Promise<void> {
-	const url = firestoreBase(env) + '/' + collectionPath + '?documentId=' + encodeURIComponent(documentId);
-	const response = await fetch(url, {
-		method: 'POST',
-		headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
-		body: JSON.stringify({ fields }),
-	});
-	if (!response.ok) {
-		throw new Error('Could not create the Firestore document: ' + response.status + ' ' + (await response.text()));
 	}
 }
 
