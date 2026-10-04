@@ -191,6 +191,31 @@ export default {
 			return json({ error: 'Registration failed. Try again.' }, 500, origin);
 		}
 	},
+
+	// The cron trigger in wrangler.jsonc fires this nightly at 03:00 SAST.
+	// The privacy policy keeps contact submissions for twelve months and
+	// ticket records for twelve months after the event, and this is what
+	// makes that true. Firestore TTL policies would do the deleting without
+	// code, but they are out of reach on the Spark plan and the project
+	// deliberately stays free, so the cron runs the purge through the same
+	// REST API the fetch handler uses. There is no caller to answer, so
+	// every failure is logged and swallowed: throwing would only mark the
+	// run as failed, while tomorrow night clears whatever tonight missed.
+	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+		try {
+			const accessToken = await getAccessToken(env);
+			const cutoff = twelveMonthsAgoIso();
+			const submissionsDeleted = await purgeExpired(env, accessToken, 'submissions', 'createdAt', cutoff);
+			// A ticket whose event never had a start date carries no
+			// eventStartsAt, so it never matches the query and is never
+			// deleted: the policy counts from the event, and there is
+			// nothing to count from.
+			const ticketsDeleted = await purgeExpired(env, accessToken, 'tickets', 'eventStartsAt', cutoff);
+			console.log('Retention purge: deleted ' + submissionsDeleted + ' from submissions and ' + ticketsDeleted + ' from tickets.');
+		} catch (error) {
+			console.error('Retention purge failed:', error);
+		}
+	},
 };
 
 // The contact form writes the Firestore document itself. This endpoint only
@@ -904,6 +929,86 @@ function parseFields(fields: Record<string, any>): Record<string, unknown> {
 		}
 	}
 	return result;
+}
+
+// --- Retention purge ---
+//
+// The scheduled handler's half of the Firestore REST work: one query per
+// collection for documents past the retention cutoff, then one commit of
+// delete writes. Twelve calendar months rather than a flat 365 days, so a
+// record kept on 31 March is purged on 31 March the next year, which is
+// how a person reading the policy would count it.
+
+const RETENTION_MONTHS = 12;
+
+// One commit per collection holds every delete, and Firestore caps a
+// commit at 500 writes, so the query stops at 400. Anything one night
+// cannot finish is finished the next.
+const RETENTION_QUERY_LIMIT = 400;
+
+function twelveMonthsAgoIso(): string {
+	const cutoff = new Date();
+	cutoff.setUTCMonth(cutoff.getUTCMonth() - RETENTION_MONTHS);
+	return cutoff.toISOString();
+}
+
+// Queries one collection for documents whose date field falls before the
+// cutoff and deletes them in a single commit. Returns how many were
+// deleted, or 0 when nothing matched or anything failed: the two
+// collections purge independently, and a failure here must be logged
+// rather than stop the other purge or escape the scheduled handler.
+async function purgeExpired(
+	env: Env,
+	accessToken: string,
+	collection: string,
+	field: string,
+	cutoffIso: string,
+): Promise<number> {
+	try {
+		const response = await fetch(firestoreBase(env) + ':runQuery', {
+			method: 'POST',
+			headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				structuredQuery: {
+					from: [{ collectionId: collection }],
+					where: {
+						fieldFilter: {
+							field: { fieldPath: field },
+							op: 'LESS_THAN',
+							value: timestampValue(cutoffIso),
+						},
+					},
+					limit: RETENTION_QUERY_LIMIT,
+				},
+			}),
+		});
+		if (!response.ok) {
+			throw new Error('Could not query ' + collection + ': ' + response.status + ' ' + (await response.text()));
+		}
+
+		// The rows carry full document names, but the delete writes are
+		// built from the id through documentName() like every other write
+		// in this file.
+		const rows = (await response.json()) as { document?: { name: string } }[];
+		const ids = rows.filter((row) => row.document).map((row) => row.document!.name.split('/').pop() as string);
+		if (ids.length === 0) {
+			return 0;
+		}
+
+		const writes = ids.map((id) => ({ delete: documentName(env, collection + '/' + id) }));
+		const commitResponse = await fetch(firestoreBase(env) + ':commit', {
+			method: 'POST',
+			headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ writes }),
+		});
+		if (!commitResponse.ok) {
+			throw new Error('Could not delete ' + collection + ': ' + commitResponse.status + ' ' + (await commitResponse.text()));
+		}
+		return ids.length;
+	} catch (error) {
+		console.error('Retention purge of ' + collection + ' failed:', error);
+		return 0;
+	}
 }
 
 // --- Service account auth ---

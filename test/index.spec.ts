@@ -1,5 +1,5 @@
 import { env, createExecutionContext, waitOnExecutionContext, fetchMock } from 'cloudflare:test';
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import worker from '../src/index';
 
 // Same shape as the upload Worker's test file: real crypto for the parts
@@ -788,6 +788,165 @@ describe('the contact notify endpoint', () => {
 		await waitOnExecutionContext(ctx);
 		expect(response.status).toBe(204);
 		expect(response.headers.get('Access-Control-Allow-Origin')).toBe('http://127.0.0.1:5500');
+	});
+});
+
+// The scheduled half of the Worker: the nightly retention purge from the
+// cron trigger. Same testing approach as the fetch tests above, mocked
+// Firestore answering the runQuery and commit calls, and no mock at all
+// standing in for the OAuth exchange because beforeAll() already persists
+// a token for the whole file.
+describe('retention purge', () => {
+	// Fires the scheduled handler the way the platform does. The controller
+	// is a plain stand-in: nothing in the Worker reads it.
+	async function runScheduled(): Promise<void> {
+		const ctx = createExecutionContext();
+		await worker.scheduled({ scheduledTime: Date.now(), cron: '0 1 * * *', noRetry: () => {} } as ScheduledController, testEnv, ctx);
+		await waitOnExecutionContext(ctx);
+	}
+
+	// "Twelve calendar months back" is what the policy counts, and the test
+	// cannot know the exact millisecond the run will compute it, so the
+	// sent cutoff has to land between the same sum taken either side of it.
+	function twelveMonthsAgo(): Date {
+		const date = new Date();
+		date.setUTCMonth(date.getUTCMonth() - 12);
+		return date;
+	}
+
+	function retentionRow(collection: string, id: string) {
+		return {
+			document: {
+				name: `projects/autism-allyship/databases/(default)/documents/${collection}/${id}`,
+				fields: {},
+			},
+		};
+	}
+
+	it('sends each collection a cutoff twelve calendar months back, limited to 400 documents', async () => {
+		let submissionsQuery = '';
+		let ticketsQuery = '';
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':runQuery', method: 'POST' })
+			.reply(200, ({ body }) => {
+				submissionsQuery = String(body);
+				return [];
+			});
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':runQuery', method: 'POST' })
+			.reply(200, ({ body }) => {
+				ticketsQuery = String(body);
+				return [];
+			});
+
+		const before = twelveMonthsAgo();
+		await runScheduled();
+		const after = twelveMonthsAgo();
+
+		const submissions = JSON.parse(submissionsQuery).structuredQuery;
+		expect(submissions.from).toEqual([{ collectionId: 'submissions' }]);
+		expect(submissions.where.fieldFilter.field.fieldPath).toBe('createdAt');
+		expect(submissions.where.fieldFilter.op).toBe('LESS_THAN');
+		expect(submissions.limit).toBe(400);
+		const submissionsCutoff = new Date(submissions.where.fieldFilter.value.timestampValue);
+		expect(submissionsCutoff.getTime()).toBeGreaterThanOrEqual(before.getTime());
+		expect(submissionsCutoff.getTime()).toBeLessThanOrEqual(after.getTime());
+
+		const tickets = JSON.parse(ticketsQuery).structuredQuery;
+		expect(tickets.from).toEqual([{ collectionId: 'tickets' }]);
+		expect(tickets.where.fieldFilter.field.fieldPath).toBe('eventStartsAt');
+		expect(tickets.where.fieldFilter.op).toBe('LESS_THAN');
+		expect(tickets.limit).toBe(400);
+		const ticketsCutoff = new Date(tickets.where.fieldFilter.value.timestampValue);
+		expect(ticketsCutoff.getTime()).toBeGreaterThanOrEqual(before.getTime());
+		expect(ticketsCutoff.getTime()).toBeLessThanOrEqual(after.getTime());
+	});
+
+	it('deletes every matching document in one commit per collection and logs the counts', async () => {
+		// fetchMock consumes runQuery interceptors in registration order,
+		// and the submissions purge runs before the tickets purge, so the
+		// first registered mock answers the submissions query and the
+		// second the tickets query. Same for the two commit mocks.
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':runQuery', method: 'POST' })
+			.reply(200, [retentionRow('submissions', 'sub-1'), retentionRow('submissions', 'sub-2')]);
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':runQuery', method: 'POST' })
+			.reply(200, [retentionRow('tickets', 'tick-1')]);
+
+		let submissionsCommit = '';
+		let ticketsCommit = '';
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':commit', method: 'POST' })
+			.reply(200, ({ body }) => {
+				submissionsCommit = String(body);
+				return {};
+			});
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':commit', method: 'POST' })
+			.reply(200, ({ body }) => {
+				ticketsCommit = String(body);
+				return {};
+			});
+
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		await runScheduled();
+
+		const documentBase = 'projects/autism-allyship/databases/(default)/documents/';
+		expect(submissionsCommit).toContain('{"delete":"' + documentBase + 'submissions/sub-1"}');
+		expect(submissionsCommit).toContain('{"delete":"' + documentBase + 'submissions/sub-2"}');
+		expect(ticketsCommit).toContain('{"delete":"' + documentBase + 'tickets/tick-1"}');
+		expect(logSpy).toHaveBeenCalledWith('Retention purge: deleted 2 from submissions and 1 from tickets.');
+		logSpy.mockRestore();
+	});
+
+	it('commits nothing when neither collection has expired documents', async () => {
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':runQuery', method: 'POST' })
+			.reply(200, []);
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':runQuery', method: 'POST' })
+			.reply(200, []);
+
+		// A counting commit mock rather than none at all: the handler's own
+		// catch would swallow the unmocked-request error and hide the bug
+		// this is here to catch.
+		let commits = 0;
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':commit', method: 'POST' })
+			.reply(200, () => {
+				commits++;
+				return {};
+			});
+
+		await runScheduled();
+		expect(commits).toBe(0);
+	});
+
+	it('logs a Firestore error rather than throwing it out of the handler', async () => {
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':runQuery', method: 'POST' })
+			.reply(500, { error: { message: 'internal error' } });
+		fetchMock
+			.get(FIRESTORE_ORIGIN)
+			.intercept({ path: DOCS_PATH + ':runQuery', method: 'POST' })
+			.reply(500, { error: { message: 'internal error' } });
+
+		const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		await expect(runScheduled()).resolves.toBeUndefined();
+		// Both collections fail independently and each logs its own error.
+		expect(errorSpy).toHaveBeenCalledTimes(2);
+		errorSpy.mockRestore();
 	});
 });
 

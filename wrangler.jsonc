@@ -11,6 +11,11 @@
 	"observability": {
 		"enabled": true,
 	},
+	// The nightly retention purge. 01:00 UTC is 03:00 SAST. South Africa does
+	// not observe daylight saving, so this stays at 03:00 local all year.
+	"triggers": {
+		"crons": ["0 1 * * *"]
+	},
 	"upload_source_maps": true,
 	"vars": {
 		"FIREBASE_PROJECT_ID": "autism-allyship",
