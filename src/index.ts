@@ -682,12 +682,19 @@ async function sendConfirmationEmail(env: Env, input: ConfirmationEmailInput): P
 	}
 }
 
+// Workers run in UTC, so without a time zone a 10:00 picnic would be mailed
+// as 08:00, and anything before 02:00 would land on the previous day. The
+// foundation operates in one zone only, the same assumption endOfDaySast
+// makes above.
 function formatEventTime(iso: string): string {
 	const date = new Date(iso);
 	if (Number.isNaN(date.getTime())) {
 		return '';
 	}
-	return date.toLocaleDateString('en-ZA') + ' ' + date.toLocaleTimeString('en-ZA', { hour: '2-digit', minute: '2-digit' });
+	const timeZone = 'Africa/Johannesburg';
+	return (
+		date.toLocaleDateString('en-ZA', { timeZone }) + ' ' + date.toLocaleTimeString('en-ZA', { timeZone, hour: '2-digit', minute: '2-digit' })
+	);
 }
 
 // The ticket link goes in as a plain visible URL, not only inside a styled
