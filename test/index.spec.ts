@@ -532,6 +532,29 @@ describe('the ticket registration endpoint', () => {
 		expect(brevoBody).toContain('https://autism-allyship.pages.dev/ticket.html?token=');
 	});
 
+	// The Worker runs in UTC and the foundation in SAST. 08:00 UTC is 10:00 in
+	// Pretoria, and 22:30 UTC is already half past midnight on the next day.
+	it('mails the event time in South African time, not UTC', async () => {
+		for (const [startsAt, expected] of [
+			['2027-03-14T08:00:00.000Z', '2027/03/14 10:00'],
+			['2027-03-14T22:30:00.000Z', '2027/03/15 00:30'],
+		]) {
+			mockAttempt({ event: eventFields({ startsAt }), result: 'committed' });
+			let brevoBody = '';
+			fetchMock
+				.get(BREVO_ORIGIN)
+				.intercept({ path: '/v3/smtp/email', method: 'POST' })
+				.reply(200, ({ body }) => {
+					brevoBody = String(body);
+					return { messageId: 'test-message-id' };
+				});
+
+			const response = await post(registerBody(), {}, '/ticket', envWithBrevo);
+			expect(response.status).toBe(200);
+			expect(brevoBody).toContain(expected);
+		}
+	});
+
 	it('gives two registrations different tokens', async () => {
 		mockAttempt({ event: eventFields(), result: 'committed' });
 		const first = (await (await post(registerBody())).json()) as { token: string };
